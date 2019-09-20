@@ -1,6 +1,7 @@
 #!/bin/bash
 
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
+LLVM_DPES="http://releases.llvm.org/"
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 function download() {
@@ -133,18 +134,18 @@ function install_awscpp() {
     popd
 }
 
-LLVM_VERSION=8.0.0
+LLVM_VERSION=9.0.0
 
 function install_llvm() {
     VERS=${LLVM_VERSION}
-    download ${HTTP_DEPS}/llvm/$VERS/llvm-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/cfe-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/compiler-rt-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/lldb-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/lld-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/libcxx-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/libcxxabi-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/clang-tools-extra-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/llvm-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/cfe-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/compiler-rt-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/lldb-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/lld-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/libcxx-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/libcxxabi-$VERS.src.tar.xz
+    download ${LLVM_DEPS}/$VERS/clang-tools-extra-$VERS.src.tar.xz
     rm -rf llvm-$VERS.src
     extract llvm-$VERS.src.tar.xz
     extract cfe-$VERS.src.tar.xz
