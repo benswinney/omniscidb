@@ -133,7 +133,7 @@ function install_awscpp() {
     popd
 }
 
-LLVM_VERSION=10.0.0
+LLVM_VERSION=8.0.0
 
 function install_llvm() {
     VERS=${LLVM_VERSION}
