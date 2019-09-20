@@ -1,7 +1,7 @@
 #!/bin/bash
 
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
-LLVM_DPES="http://releases.llvm.org/"
+LLVM_DEPS="http://releases.llvm.org/"
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 function download() {
