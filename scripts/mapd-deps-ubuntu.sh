@@ -78,7 +78,7 @@ export PATH=$PREFIX/bin:$PATH
 
 # llvm
 # (see common-functions.sh)
-install_llvm
+#install_llvm
 
 # Geo Support
 install_gdal
