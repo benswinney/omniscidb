@@ -60,6 +60,7 @@ function install_arrow() {
 
   pushd arrow-$ARROW_VERSION
   patch -p 1 < ${SCRIPTS_DIR}/ARROW-5517-C-Only-check-header-basename-for-internal.patch
+  sed -i '20i#include "logging.h"' cpp/src/arrow/util/sse-util.h
   popd
 
   mkdir -p arrow-$ARROW_VERSION/cpp/build
