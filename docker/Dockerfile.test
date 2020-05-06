@@ -1,0 +1,44 @@
+# Build libglvnd for libGL, libEGL, libOpenGL
+# Not currently pulled in by nvidia-docker2
+FROM nvidia/cuda-ppc64le:10.0-devel AS glvnd
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        libtool \
+        pkg-config \
+        python \
+        libxext-dev \
+        libx11-dev \
+        git \
+       wget \
+        build-essential \
+        cmake \
+        libssl-dev \ 
+         lsb-core \
+        libgtest-dev \
+	software-properties-common \
+        x11proto-gl-dev && \
+    apt-get remove --purge -y && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /libglvnd/
+ADD https://github.com/NVIDIA/libglvnd/archive/v1.0.0.tar.gz .
+RUN tar xvf v1.0.0.tar.gz --strip-components=1
+RUN ./autogen.sh
+RUN ./configure --disable-glx && \
+    make -j 32 && \
+    make install
+
+RUN cd /usr/src/gtest && cmake -DBUILD_SHARED_LIBS=ON && make && make install
+
+# copy or symlink libgtest.a and libgtest_main.a to your /usr/lib folder
+WORKDIR /omniscidb/ 
+COPY BuildClangOnLinux.sh /omniscidb/
+RUN mkdir -p patches/llvm/8.0.1/ && wget https://bugs.llvm.org/attachment.cgi?id=22389 -O /omniscidb/patches/llvm/8.0.1/001-libcxx-bug-39696-llvm-8.0.1-ppc64le.patch &&   chmod +x BuildClangOnLinux.sh && TERM=xterm ./BuildClangOnLinux.sh
+
+SHELL ["/bin/bash", "-c"]
+RUN git clone https://github.com/adamjm/omniscidb.git /omniscidb-git && cd /omniscidb-git && git checkout ppc64le_support && sed -i 's/sudo//g' ./scripts/mapd-deps-ubuntu.sh && ./scripts/mapd-deps-ubuntu.sh
+
+RUN git clone https://github.com/omnisci/omniscidb.git /omniscidb-master-git &&  export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_ppc64le/v14_clang-8.0.1-centos7/powerpc64le-unknown-linux-gnu/lib && export PATH=$PATH:/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_ppc64le/v14_clang-8.0.1-centos7/powerpc64le-unknown-linux-gnu/bin && source /usr/local/mapd-deps/mapd-deps.sh && cd /omniscidb && wget https://github.com/omnisci/omniscidb/archive/v4.8.1.tar.gz && tar xvf v4.8.1.tar.gz && cd omniscidb-4.8.1 &&  cp /omniscidb-master-git/CMakeLists.txt . && sed -i 's/-lstdc++/-lstdc++ -ldl/g' CMakeLists.txt && sed -i 's/-lcrypto/-lcrypto -ldl -lutil/g' ThirdParty/librdkafka/configure.librdkafka && cat ThirdParty/librdkafka/configure.librdkafka && mkdir build && cd build && cmake -DPREFER_STATIC_LIBS=on -DCMAKE_BUILD_TYPE=release .. 
+#&& make -j 64 && cpack -G TGZ
+
