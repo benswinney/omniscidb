@@ -19,7 +19,7 @@
 
 #include "Execute.h"
 #include "QueryFeatures.h"
-#include "RelAlgAbstractInterpreter.h"
+#include "RelAlgDagBuilder.h"
 
 #include <ctime>
 #include <memory>
@@ -61,9 +61,9 @@ class RelAlgTranslator {
       const RexAgg* rex,
       const std::vector<std::shared_ptr<Analyzer::Expr>>& scalar_sources);
 
- private:
   static std::shared_ptr<Analyzer::Expr> translateLiteral(const RexLiteral*);
 
+ private:
   std::shared_ptr<Analyzer::Expr> translateScalarSubquery(const RexSubQuery*) const;
 
   std::shared_ptr<Analyzer::Expr> translateInput(const RexInput*) const;
@@ -102,6 +102,8 @@ class RelAlgTranslator {
   std::shared_ptr<Analyzer::Expr> translateLength(const RexFunctionOperator*) const;
 
   std::shared_ptr<Analyzer::Expr> translateKeyForString(const RexFunctionOperator*) const;
+
+  std::shared_ptr<Analyzer::Expr> translateLower(const RexFunctionOperator*) const;
 
   std::shared_ptr<Analyzer::Expr> translateCardinality(const RexFunctionOperator*) const;
 
@@ -143,6 +145,9 @@ class RelAlgTranslator {
 
   std::shared_ptr<Analyzer::Expr> translateGeoComparison(const RexOperator*) const;
 
+  std::shared_ptr<Analyzer::Expr> translateGeoConstructor(
+      const RexFunctionOperator*) const;
+
   std::shared_ptr<Analyzer::Expr> translateGeoOverlapsOper(const RexOperator*) const;
 
   std::vector<std::shared_ptr<Analyzer::Expr>> translateGeoFunctionArg(
@@ -151,7 +156,8 @@ class RelAlgTranslator {
       int32_t& lindex,
       const bool with_bounds,
       const bool with_render_group,
-      const bool expand_geo_col) const;
+      const bool expand_geo_col,
+      const bool is_projection = false) const;
 
   std::vector<std::shared_ptr<Analyzer::Expr>> translateGeoColumn(
       const RexInput*,
@@ -183,5 +189,11 @@ QualsConjunctiveForm qual_to_conjunctive_form(
 
 std::vector<std::shared_ptr<Analyzer::Expr>> qual_to_disjunctive_form(
     const std::shared_ptr<Analyzer::Expr>& qual_expr);
+
+inline auto func_resolve = [](auto funcname, auto&&... strlist) {
+  return ((funcname == strlist) || ...);
+};
+
+using namespace std::literals;
 
 #endif  // QUERYENGINE_RELALGTRANSLATOR_H

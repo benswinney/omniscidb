@@ -26,6 +26,7 @@
 #include "TypePunning.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -143,17 +144,12 @@
   DEF_CMP_NULLABLE_RHS(type, null_type, le, <=)      \
   DEF_CMP_NULLABLE_RHS(type, null_type, ge, >=)
 
+DEF_BINARY_NULLABLE_ALL_OPS(int8_t, int64_t)
 DEF_BINARY_NULLABLE_ALL_OPS(int16_t, int64_t)
 DEF_BINARY_NULLABLE_ALL_OPS(int32_t, int64_t)
 DEF_BINARY_NULLABLE_ALL_OPS(int64_t, int64_t)
 DEF_BINARY_NULLABLE_ALL_OPS(float, float)
 DEF_BINARY_NULLABLE_ALL_OPS(double, double)
-DEF_CMP_NULLABLE(int8_t, int64_t, eq, ==)
-DEF_CMP_NULLABLE(int8_t, int64_t, ne, !=)
-DEF_CMP_NULLABLE_LHS(int8_t, int64_t, eq, ==)
-DEF_CMP_NULLABLE_LHS(int8_t, int64_t, ne, !=)
-DEF_CMP_NULLABLE_RHS(int8_t, int64_t, eq, ==)
-DEF_CMP_NULLABLE_RHS(int8_t, int64_t, ne, !=)
 DEF_ARITH_NULLABLE(int8_t, int64_t, mod, %)
 DEF_ARITH_NULLABLE(int16_t, int64_t, mod, %)
 DEF_ARITH_NULLABLE(int32_t, int64_t, mod, %)
@@ -210,6 +206,7 @@ extern "C" ALWAYS_INLINE int64_t scale_decimal_down_not_nullable(const int64_t o
     return operand == null_val ? null_val : -operand;                                \
   }
 
+DEF_UMINUS_NULLABLE(int8_t, int8_t)
 DEF_UMINUS_NULLABLE(int16_t, int16_t)
 DEF_UMINUS_NULLABLE(int32_t, int32_t)
 DEF_UMINUS_NULLABLE(int64_t, int64_t)
@@ -328,7 +325,10 @@ extern "C" ALWAYS_INLINE int8_t bit_is_set(const int64_t bitset,
     return null_bool_val;
   }
   if (val < min_val || val > max_val) {
-    return false;
+    return 0;
+  }
+  if (!bitset) {
+    return 0;
   }
   const uint64_t bitmap_idx = val - min_val;
   return (reinterpret_cast<const int8_t*>(bitset))[bitmap_idx >> 3] &
@@ -353,6 +353,24 @@ extern "C" ALWAYS_INLINE void agg_min(int64_t* agg, const int64_t val) {
 
 extern "C" ALWAYS_INLINE void agg_id(int64_t* agg, const int64_t val) {
   *agg = val;
+}
+
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id(int64_t* agg,
+                                                       const int64_t val,
+                                                       const int64_t null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == val) {
+    return 0;
+  } else if (*agg == null_val) {
+    *agg = val;
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
 }
 
 extern "C" ALWAYS_INLINE void agg_count_distinct_bitmap_skip_val(int64_t* agg,
@@ -408,10 +426,33 @@ DEF_AGG_MIN_INT(8)
     *agg = val;                                                                        \
   }
 
+#define DEF_CHECKED_SINGLE_AGG_ID_INT(n)                                  \
+  extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_int##n(          \
+      int##n##_t* agg, const int##n##_t val, const int##n##_t null_val) { \
+    if (val == null_val) {                                                \
+      return 0;                                                           \
+    }                                                                     \
+    if (*agg == val) {                                                    \
+      return 0;                                                           \
+    } else if (*agg == null_val) {                                        \
+      *agg = val;                                                         \
+      return 0;                                                           \
+    } else {                                                              \
+      /* see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES*/            \
+      return 15;                                                          \
+    }                                                                     \
+  }
+
 DEF_AGG_ID_INT(32)
 DEF_AGG_ID_INT(16)
 DEF_AGG_ID_INT(8)
+
+DEF_CHECKED_SINGLE_AGG_ID_INT(32)
+DEF_CHECKED_SINGLE_AGG_ID_INT(16)
+DEF_CHECKED_SINGLE_AGG_ID_INT(8)
+
 #undef DEF_AGG_ID_INT
+#undef DEF_CHECKED_SINGLE_AGG_ID_INT
 
 #define DEF_WRITE_PROJECTION_INT(n)                                     \
   extern "C" ALWAYS_INLINE void write_projection_int##n(                \
@@ -540,6 +581,24 @@ extern "C" ALWAYS_INLINE void agg_id_double(int64_t* agg, const double val) {
   *agg = *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)));
 }
 
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_double(int64_t* agg,
+                                                              const double val,
+                                                              const double null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)))) {
+    return 0;
+  } else if (*agg == *(reinterpret_cast<const int64_t*>(may_alias_ptr(&null_val)))) {
+    *agg = *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)));
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
+}
+
 extern "C" ALWAYS_INLINE uint32_t agg_count_float(uint32_t* agg, const float val) {
   return (*agg)++;
 }
@@ -561,6 +620,24 @@ extern "C" ALWAYS_INLINE void agg_min_float(int32_t* agg, const float val) {
 
 extern "C" ALWAYS_INLINE void agg_id_float(int32_t* agg, const float val) {
   *agg = *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)));
+}
+
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_float(int32_t* agg,
+                                                             const float val,
+                                                             const float null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)))) {
+    return 0;
+  } else if (*agg == *(reinterpret_cast<const int32_t*>(may_alias_ptr(&null_val)))) {
+    *agg = *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)));
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
 }
 
 extern "C" ALWAYS_INLINE uint64_t agg_count_double_skip_val(uint64_t* agg,
@@ -707,6 +784,43 @@ DEF_SHARED_AGG_STUBS(agg_max)
 DEF_SHARED_AGG_STUBS(agg_min)
 DEF_SHARED_AGG_STUBS(agg_id)
 
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_shared(int64_t* agg,
+                                                            const int64_t val,
+                                                            const int64_t null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_int32_shared(int32_t* agg,
+                                   const int32_t val,
+                                   const int32_t null_val) {
+  return 0;
+}
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_int16_shared(int16_t* agg,
+                                   const int16_t val,
+                                   const int16_t null_val) {
+  return 0;
+}
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_int8_shared(int8_t* agg,
+                                                                 const int8_t val,
+                                                                 const int8_t null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_double_shared(int64_t* agg,
+                                    const double val,
+                                    const double null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_float_shared(int32_t* agg,
+                                                                  const float val,
+                                                                  const float null_val) {
+  return 0;
+}
+
 extern "C" GPU_RT_STUB void agg_max_int16_skip_val_shared(int16_t* agg,
                                                           const int16_t val,
                                                           const int16_t skip_val) {}
@@ -759,7 +873,11 @@ extern "C" GPU_RT_STUB void force_sync() {}
 
 extern "C" GPU_RT_STUB void sync_warp() {}
 extern "C" GPU_RT_STUB void sync_warp_protected(int64_t thread_pos, int64_t row_count) {}
+extern "C" GPU_RT_STUB void sync_threadblock() {}
 
+extern "C" GPU_RT_STUB void write_back_non_grouped_agg(int64_t* input_buffer,
+                                                       int64_t* output_buffer,
+                                                       const int32_t num_agg_cols){};
 // x64 stride functions
 
 extern "C" __attribute__((noinline)) int32_t pos_start_impl(int32_t* error_code) {
@@ -780,6 +898,18 @@ extern "C" __attribute__((noinline)) int32_t pos_step_impl() {
 }
 
 extern "C" GPU_RT_STUB int8_t thread_warp_idx(const int8_t warp_sz) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int64_t get_thread_index() {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int64_t* declare_dynamic_shared_memory() {
+  return nullptr;
+}
+
+extern "C" GPU_RT_STUB int64_t get_block_index() {
   return 0;
 }
 
@@ -814,44 +944,9 @@ extern "C" __attribute__((noinline)) void write_back_nop(int64_t* dest,
   assert(dest);
 }
 
-extern "C" __attribute__((noinline)) const int64_t* init_shared_mem(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
-  return init_shared_mem_nop(groups_buffer, groups_buffer_size);
-}
-
-extern "C" __attribute__((noinline)) const int64_t* init_shared_mem_dynamic(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
+extern "C" int64_t* init_shared_mem(const int64_t* global_groups_buffer,
+                                    const int32_t groups_buffer_size) {
   return nullptr;
-}
-
-extern "C" __attribute__((noinline)) void write_back(int64_t* dest,
-                                                     int64_t* src,
-                                                     const int32_t sz) {
-  write_back_nop(dest, src, sz);
-}
-
-extern "C" __attribute__((noinline)) void write_back_smem_nop(int64_t* dest,
-                                                              int64_t* src,
-                                                              const int32_t sz) {
-  assert(dest);
-}
-
-extern "C" __attribute__((noinline)) void agg_from_smem_to_gmem_nop(int64_t* dest,
-                                                                    int64_t* src,
-                                                                    const int32_t sz) {
-  assert(dest);
-}
-
-extern "C" __attribute__((noinline)) void
-agg_from_smem_to_gmem_count_binId(int64_t* dest, int64_t* src, const int32_t sz) {
-  return agg_from_smem_to_gmem_nop(dest, src, sz);
-}
-
-extern "C" __attribute__((noinline)) void
-agg_from_smem_to_gmem_binId_count(int64_t* dest, int64_t* src, const int32_t sz) {
-  return agg_from_smem_to_gmem_nop(dest, src, sz);
 }
 
 extern "C" __attribute__((noinline)) void init_group_by_buffer_gpu(
@@ -1028,6 +1123,19 @@ extern "C" ALWAYS_INLINE int64_t* get_matching_group_value_perfect_hash(
     }
   }
   return groups_buffer + off + key_count;
+}
+
+/**
+ * For a particular hashed index (only used with multi-column perfect hash group by)
+ * it returns the row-wise offset of the group in the output buffer.
+ * Since it is intended for keyless hash use, it assumes there is no group columns
+ * prepending the output buffer.
+ */
+extern "C" ALWAYS_INLINE int64_t* get_matching_group_value_perfect_hash_keyless(
+    int64_t* groups_buffer,
+    const uint32_t hashed_index,
+    const uint32_t row_size_quad) {
+  return groups_buffer + row_size_quad * hashed_index;
 }
 
 /*
@@ -1255,4 +1363,31 @@ extern "C" void multifrag_query(const int8_t*** col_buffers,
                total_matched,
                error_code);
   }
+}
+
+extern "C" ALWAYS_INLINE DEVICE bool check_interrupt() {
+  if (check_interrupt_init(static_cast<unsigned>(INT_CHECK))) {
+    return true;
+  }
+  return false;
+}
+
+extern "C" bool check_interrupt_init(unsigned command) {
+  static std::atomic_bool runtime_interrupt_flag{false};
+
+  if (command == static_cast<unsigned>(INT_CHECK)) {
+    if (runtime_interrupt_flag.load()) {
+      return true;
+    }
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_ABORT)) {
+    runtime_interrupt_flag.store(true);
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_RESET)) {
+    runtime_interrupt_flag.store(false);
+    return false;
+  }
+  return false;
 }

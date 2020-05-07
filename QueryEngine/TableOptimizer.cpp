@@ -107,7 +107,7 @@ inline CompilationOptions get_compilation_options(const ExecutorDeviceType& devi
 
 inline ExecutionOptions get_execution_options() {
   return ExecutionOptions{
-      false, false, false, false, false, false, false, false, 0, false, false, 0};
+      false, false, false, false, false, false, false, false, 0, false, false, 0, false};
 }
 
 }  // namespace
@@ -163,7 +163,7 @@ void TableOptimizer::recomputeMetadata() const {
       std::unordered_map</*fragment_id*/ int, ChunkStats> stats_map;
 
       size_t total_num_tuples = 0;
-      PerFragmentCB compute_deleted_callback =
+      Executor::PerFragmentCallBack compute_deleted_callback =
           [&stats_map, &tuple_count_map, &total_num_tuples, cd](
               ResultSetPtr results,
               const Fragmenter_Namespace::FragmentInfo& fragment_info) {
@@ -235,7 +235,7 @@ void TableOptimizer::recomputeMetadata() const {
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_deleted_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
       fragmenter->setNumRows(total_num_tuples);
@@ -279,7 +279,7 @@ void TableOptimizer::recomputeMetadata() const {
 
       std::unordered_map</*fragment_id*/ int, ChunkStats> stats_map;
 
-      PerFragmentCB compute_metadata_callback =
+      Executor::PerFragmentCallBack compute_metadata_callback =
           [&stats_map, &tuple_count_map, cd](
               ResultSetPtr results,
               const Fragmenter_Namespace::FragmentInfo& fragment_info) {
@@ -327,7 +327,7 @@ void TableOptimizer::recomputeMetadata() const {
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_metadata_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
     }

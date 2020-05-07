@@ -9,8 +9,8 @@ PREFIX=/usr/local/mapd-deps
 source /etc/os-release
 if [ "$ID" == "ubuntu" ] ; then
   PACKAGER="apt -y"
-  if [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
-    echo "Ubuntu 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
+  if [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
+    echo "Ubuntu 19.10, 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
     exit 1
   fi
 elif [ "$ID" == "centos" ] ; then
@@ -137,7 +137,7 @@ PATH=/usr/local/cuda/bin:\$PATH
 PATH=\$PREFIX/bin:\$PATH
 
 VULKAN_SDK=\$PREFIX
-VK_LAYER_PATH=\$PREFIX/etc/explicit_layer.d
+VK_LAYER_PATH=\$PREFIX/etc/vulkan/explicit_layer.d
 
 CMAKE_PREFIX_PATH=\$PREFIX:\$CMAKE_PREFIX_PATH
 

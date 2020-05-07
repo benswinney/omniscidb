@@ -52,7 +52,7 @@ class GlobalFileMgr;  // forward declaration
                        * A multimap is used to associate the key (page size) with values (file identifiers of
                        * files                       having the matching page size).
                        */
-typedef std::multimap<size_t, int> PageSizeFileMMap;
+using PageSizeFileMMap = std::multimap<size_t, int>;
 
 /**
  * @type Chunk
@@ -76,7 +76,7 @@ using Chunk = FileBuffer;
  * and so ChunkKeyToChunkMap maps chunk keys to Chunk types, which are
  * vectors of MultiPage* pointers (logical pages).
  */
-typedef std::map<ChunkKey, FileBuffer*> ChunkKeyToChunkMap;
+using ChunkKeyToChunkMap = std::map<ChunkKey, FileBuffer*>;
 
 /**
  * @class   FileMgr
@@ -229,6 +229,8 @@ class FileMgr : public AbstractBufferMgr {  // implements
   void createTopLevelMetadata();  // create metadata shared by all tables of all DBs
   std::string getFileMgrBasePath() const { return fileMgrBasePath_; }
   void closeRemovePhysical();
+
+  void removeTableRelatedDS(const int db_id, const int table_id) override;
 
   void free_page(std::pair<FileInfo*, int>&& page);
   const std::pair<const int, const int> get_fileMgrKey() const { return fileMgrKey_; }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "BufferMgr/CpuBufferMgr/CpuBufferMgr.h"
 #include "BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.h"
 #include "FileMgr/GlobalFileMgr.h"
+#include "PersistentStorageMgr/PersistentStorageMgr.h"
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -41,10 +42,12 @@ using namespace std;
 using namespace Buffer_Namespace;
 using namespace File_Namespace;
 
+extern bool g_enable_fsi;
+
 namespace Data_Namespace {
 
 DataMgr::DataMgr(const string& dataDir,
-                 const MapDParameters& mapd_parameters,
+                 const SystemParameters& system_parameters,
                  const bool useGpus,
                  const int numGpus,
                  const int startGpu,
@@ -56,14 +59,16 @@ DataMgr::DataMgr(const string& dataDir,
       cudaMgr_ = std::make_unique<CudaMgr_Namespace::CudaMgr>(numGpus, startGpu);
       reservedGpuMem_ = reservedGpuMem;
       hasGpus_ = true;
-    } catch (std::runtime_error& error) {
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Unable to instantiate CudaMgr, falling back to CPU-only mode. "
+                 << e.what();
       hasGpus_ = false;
     }
   } else {
     hasGpus_ = false;
   }
 
-  populateMgrs(mapd_parameters, numReaderThreads);
+  populateMgrs(system_parameters, numReaderThreads);
   createTopLevelMetadata();
 }
 
@@ -76,7 +81,60 @@ DataMgr::~DataMgr() {
   }
 }
 
-size_t DataMgr::getTotalSystemMemory() {
+DataMgr::SystemMemoryUsage DataMgr::getSystemMemoryUsage() const {
+  SystemMemoryUsage usage;
+
+#ifdef __linux__
+
+  // Determine Linux available memory and total memory.
+  // Available memory is different from free memory because
+  // when Linux sees free memory, it tries to use it for
+  // stuff like disk caching. However, the memory is not
+  // reserved and is still available to be allocated by
+  // user processes.
+  // Parsing /proc/meminfo for this info isn't very elegant
+  // but as a virtual file it should be reasonably fast.
+  // See also:
+  //   https://github.com/torvalds/linux/commit/34e431b0ae398fc54ea69ff85ec700722c9da773
+  ProcMeminfoParser mi;
+  usage.free = mi["MemAvailable"];
+  usage.total = mi["MemTotal"];
+
+  // Determine process memory in use.
+  // See also:
+  //   https://stackoverflow.com/questions/669438/how-to-get-memory-usage-at-runtime-using-c
+  //   http://man7.org/linux/man-pages/man5/proc.5.html
+  int64_t size = 0;
+  int64_t resident = 0;
+  int64_t shared = 0;
+
+  std::ifstream fstatm("/proc/self/statm");
+  fstatm >> size >> resident >> shared;
+  fstatm.close();
+
+  long page_size =
+      sysconf(_SC_PAGE_SIZE);  // in case x86-64 is configured to use 2MB pages
+
+  usage.resident = resident * page_size;
+  usage.vtotal = size * page_size;
+  usage.regular = (resident - shared) * page_size;
+  usage.shared = shared * page_size;
+
+#else
+
+  usage.total = 0;
+  usage.free = 0;
+  usage.resident = 0;
+  usage.vtotal = 0;
+  usage.regular = 0;
+  usage.shared = 0;
+
+#endif
+
+  return usage;
+}
+
+size_t DataMgr::getTotalSystemMemory() const {
 #ifdef __APPLE__
   int mib[2];
   size_t physical_memory;
@@ -88,27 +146,37 @@ size_t DataMgr::getTotalSystemMemory() {
   sysctl(mib, 2, &physical_memory, &length, NULL, 0);
   return physical_memory;
 
-#else
+#else  // Linux
   long pages = sysconf(_SC_PHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
   return pages * page_size;
 #endif
 }
 
-void DataMgr::populateMgrs(const MapDParameters& mapd_parameters,
+void DataMgr::populateMgrs(const SystemParameters& system_parameters,
                            const size_t userSpecifiedNumReaderThreads) {
   bufferMgrs_.resize(2);
-  bufferMgrs_[0].push_back(new GlobalFileMgr(0, dataDir_, userSpecifiedNumReaderThreads));
+  if (g_enable_fsi) {
+    bufferMgrs_[0].push_back(
+        new PersistentStorageMgr(dataDir_, userSpecifiedNumReaderThreads));
+  } else {
+    bufferMgrs_[0].push_back(
+        new GlobalFileMgr(0, dataDir_, userSpecifiedNumReaderThreads));
+  }
   levelSizes_.push_back(1);
-  size_t cpuBufferSize = mapd_parameters.cpu_buffer_mem_bytes;
+  size_t cpuBufferSize = system_parameters.cpu_buffer_mem_bytes;
   if (cpuBufferSize == 0) {  // if size is not specified
-    cpuBufferSize = getTotalSystemMemory() *
+    const auto total_system_memory = getTotalSystemMemory();
+    VLOG(1) << "Detected " << (float)total_system_memory / (1024 * 1024)
+            << "M of total system memory.";
+    cpuBufferSize = total_system_memory *
                     0.8;  // should get free memory instead of this ugly heuristic
   }
   size_t cpuSlabSize = std::min(static_cast<size_t>(1L << 32), cpuBufferSize);
   // cpuSlabSize -= cpuSlabSize % 512 == 0 ? 0 : 512 - (cpuSlabSize % 512);
   cpuSlabSize = (cpuSlabSize / 512) * 512;
   LOG(INFO) << "cpuSlabSize is " << (float)cpuSlabSize / (1024 * 1024) << "M";
+  LOG(INFO) << "memory pool for CPU is " << (float)cpuBufferSize / (1024 * 1024) << "M";
   if (hasGpus_) {
     LOG(INFO) << "reserved GPU memory is " << (float)reservedGpuMem_ / (1024 * 1024)
               << "M includes render buffer allocation";
@@ -119,12 +187,14 @@ void DataMgr::populateMgrs(const MapDParameters& mapd_parameters,
     int numGpus = cudaMgr_->getDeviceCount();
     for (int gpuNum = 0; gpuNum < numGpus; ++gpuNum) {
       size_t gpuMaxMemSize =
-          mapd_parameters.gpu_buffer_mem_bytes != 0
-              ? mapd_parameters.gpu_buffer_mem_bytes
+          system_parameters.gpu_buffer_mem_bytes != 0
+              ? system_parameters.gpu_buffer_mem_bytes
               : (cudaMgr_->getDeviceProperties(gpuNum)->globalMem) - (reservedGpuMem_);
       size_t gpuSlabSize = std::min(static_cast<size_t>(1L << 31), gpuMaxMemSize);
       gpuSlabSize -= gpuSlabSize % 512 == 0 ? 0 : 512 - (gpuSlabSize % 512);
       LOG(INFO) << "gpuSlabSize is " << (float)gpuSlabSize / (1024 * 1024) << "M";
+      LOG(INFO) << "memory pool for GPU " << gpuNum << " is "
+                << (float)gpuMaxMemSize / (1024 * 1024) << "M";
       bufferMgrs_[2].push_back(new GpuCudaBufferMgr(
           gpuNum, gpuMaxMemSize, cudaMgr_.get(), gpuSlabSize, 512, bufferMgrs_[1][0]));
     }
@@ -148,7 +218,12 @@ void DataMgr::convertDB(const std::string basePath) {
     LOG(FATAL) << "Path to directory mapd_data to convert DB does not exist.";
   }
 
-  GlobalFileMgr* gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  GlobalFileMgr* gfm;
+  if (g_enable_fsi) {
+    gfm = dynamic_cast<PersistentStorageMgr*>(bufferMgrs_[0][0])->getGlobalFileMgr();
+  } else {
+    gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  }
   size_t defaultPageSize = gfm->getDefaultPageSize();
   LOG(INFO) << "Database conversion started.";
   FileMgr* fm_base_db =
@@ -168,9 +243,16 @@ void DataMgr::createTopLevelMetadata()
   chunkKey[0] = 0;  // top level db_id
   chunkKey[1] = 0;  // top level tb_id
 
-  GlobalFileMgr* gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
-  FileMgr* fm_top = gfm->getFileMgr(chunkKey);
-  fm_top->createTopLevelMetadata();
+  GlobalFileMgr* gfm;
+  if (g_enable_fsi) {
+    gfm = dynamic_cast<PersistentStorageMgr*>(bufferMgrs_[0][0])->getGlobalFileMgr();
+  } else {
+    gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  }
+  auto fm_top = gfm->getFileMgr(chunkKey);
+  if (dynamic_cast<File_Namespace::FileMgr*>(fm_top)) {
+    static_cast<File_Namespace::FileMgr*>(fm_top)->createTopLevelMetadata();
+  }
 }
 
 std::vector<MemoryInfo> DataMgr::getMemoryInfo(const MemoryLevel memLevel) {
@@ -196,7 +278,7 @@ std::vector<MemoryInfo> DataMgr::getMemoryInfo(const MemoryLevel memLevel) {
         md.startPage = segIt.start_page;
         md.numPages = segIt.num_pages;
         md.touch = segIt.last_touched;
-        md.isFree = segIt.mem_status;
+        md.memStatus = segIt.mem_status;
         md.chunk_key.insert(
             md.chunk_key.end(), segIt.chunk_key.begin(), segIt.chunk_key.end());
         mi.nodeMemoryData.push_back(md);
@@ -226,7 +308,7 @@ std::vector<MemoryInfo> DataMgr::getMemoryInfo(const MemoryLevel memLevel) {
           md.touch = segIt.last_touched;
           md.chunk_key.insert(
               md.chunk_key.end(), segIt.chunk_key.begin(), segIt.chunk_key.end());
-          md.isFree = segIt.mem_status;
+          md.memStatus = segIt.mem_status;
           mi.nodeMemoryData.push_back(md);
         }
       }
@@ -345,9 +427,9 @@ AbstractBuffer* DataMgr::getChunkBuffer(const ChunkKey& key,
                                         const MemoryLevel memoryLevel,
                                         const int deviceId,
                                         const size_t numBytes) {
-  auto level = static_cast<size_t>(memoryLevel);
-  assert(level < levelSizes_.size());     // make sure we have a legit buffermgr
-  assert(deviceId < levelSizes_[level]);  // make sure we have a legit buffermgr
+  const auto level = static_cast<size_t>(memoryLevel);
+  CHECK_LT(level, levelSizes_.size());     // make sure we have a legit buffermgr
+  CHECK_LT(deviceId, levelSizes_[level]);  // make sure we have a legit buffermgr
   return bufferMgrs_[level][deviceId]->getBuffer(key, numBytes);
 }
 
@@ -374,8 +456,8 @@ void DataMgr::deleteChunksWithPrefix(const ChunkKey& keyPrefix,
 AbstractBuffer* DataMgr::alloc(const MemoryLevel memoryLevel,
                                const int deviceId,
                                const size_t numBytes) {
-  int level = static_cast<int>(memoryLevel);
-  assert(deviceId < levelSizes_[level]);
+  const auto level = static_cast<int>(memoryLevel);
+  CHECK_LT(deviceId, levelSizes_[level]);
   return bufferMgrs_[level][deviceId]->alloc(numBytes);
 }
 
@@ -422,16 +504,50 @@ void DataMgr::checkpoint() {
 }
 
 void DataMgr::removeTableRelatedDS(const int db_id, const int tb_id) {
-  dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0])->removeTableRelatedDS(db_id, tb_id);
+  bufferMgrs_[0][0]->removeTableRelatedDS(db_id, tb_id);
 }
 
 void DataMgr::setTableEpoch(const int db_id, const int tb_id, const int start_epoch) {
-  dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0])
-      ->setTableEpoch(db_id, tb_id, start_epoch);
+  GlobalFileMgr* gfm;
+  if (g_enable_fsi) {
+    gfm = dynamic_cast<PersistentStorageMgr*>(bufferMgrs_[0][0])->getGlobalFileMgr();
+  } else {
+    gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  }
+  gfm->setTableEpoch(db_id, tb_id, start_epoch);
 }
 
 size_t DataMgr::getTableEpoch(const int db_id, const int tb_id) {
-  return dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0])->getTableEpoch(db_id, tb_id);
+  GlobalFileMgr* gfm;
+  if (g_enable_fsi) {
+    gfm = dynamic_cast<PersistentStorageMgr*>(bufferMgrs_[0][0])->getGlobalFileMgr();
+  } else {
+    gfm = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  }
+  return gfm->getTableEpoch(db_id, tb_id);
+}
+
+GlobalFileMgr* DataMgr::getGlobalFileMgr() const {
+  GlobalFileMgr* global_file_mgr;
+  if (g_enable_fsi) {
+    global_file_mgr =
+        dynamic_cast<PersistentStorageMgr*>(bufferMgrs_[0][0])->getGlobalFileMgr();
+  } else {
+    global_file_mgr = dynamic_cast<GlobalFileMgr*>(bufferMgrs_[0][0]);
+  }
+  CHECK(global_file_mgr);
+  return global_file_mgr;
+}
+
+std::ostream& operator<<(std::ostream& os, const DataMgr::SystemMemoryUsage& mem_info) {
+  os << "CPU Memory Info:";
+  os << "\n\tTotal: " << mem_info.total / (1024. * 1024.) << " MB";
+  os << "\n\tFree: " << mem_info.free / (1024. * 1024.) << " MB";
+  os << "\n\tProcess: " << mem_info.resident / (1024. * 1024.) << " MB";
+  os << "\n\tVirtual: " << mem_info.vtotal / (1024. * 1024.) << " MB";
+  os << "\n\tProcess + Swap: " << mem_info.regular / (1024. * 1024.) << " MB";
+  os << "\n\tProcess Shared: " << mem_info.shared / (1024. * 1024.) << " MB";
+  return os;
 }
 
 }  // namespace Data_Namespace

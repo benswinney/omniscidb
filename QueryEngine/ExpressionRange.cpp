@@ -200,11 +200,6 @@ ExpressionRange apply_simple_quals(
                      qual_range);
     }
   }
-  if (qual_range.getType() == ExpressionRangeType::Integer) {
-    if (qual_range.getIntMin() > qual_range.getIntMax()) {
-      return ExpressionRange::makeIntRange(0, -1, 0, qual_range.hasNulls());
-    }
-  }
   return qual_range;
 }
 
@@ -280,6 +275,15 @@ bool ExpressionRange::operator==(const ExpressionRange& other) const {
   return false;
 }
 
+bool ExpressionRange::typeSupportsRange(const SQLTypeInfo& ti) {
+  if (ti.is_array()) {
+    return typeSupportsRange(ti.get_elem_type());
+  } else {
+    return (ti.is_number() || ti.is_boolean() || ti.is_time() ||
+            (ti.is_string() && ti.get_compression() == kENCODING_DICT));
+  }
+}
+
 ExpressionRange getExpressionRange(
     const Analyzer::BinOper* expr,
     const std::vector<InputTableInfo>& query_infos,
@@ -323,6 +327,10 @@ ExpressionRange getExpressionRange(
     const std::vector<InputTableInfo>& query_infos,
     const Executor* executor,
     boost::optional<std::list<std::shared_ptr<Analyzer::Expr>>> simple_quals) {
+  const auto& expr_ti = expr->get_type_info();
+  if (!ExpressionRange::typeSupportsRange(expr_ti)) {
+    return ExpressionRange::makeInvalidRange();
+  }
   auto bin_oper_expr = dynamic_cast<const Analyzer::BinOper*>(expr);
   if (bin_oper_expr) {
     return getExpressionRange(bin_oper_expr, query_infos, executor, simple_quals);
@@ -727,16 +735,24 @@ ExpressionRange getDateTimePrecisionCastRange(const ExpressionRange& arg_range,
   const int32_t ti_dimen = target_ti.get_dimension();
   const int32_t oper_dimen = oper_ti.get_dimension();
   CHECK(oper_dimen != ti_dimen);
-  const int64_t scale =
-      DateTimeUtils::get_timestamp_precision_scale(abs(oper_dimen - ti_dimen));
   const int64_t min_ts =
       ti_dimen > oper_dimen
-          ? DateTruncateAlterPrecisionScaleUp(arg_range.getIntMin(), scale)
-          : DateTruncateAlterPrecisionScaleDown(arg_range.getIntMin(), scale);
+          ? DateTimeUtils::get_datetime_scaled_epoch(DateTimeUtils::ScalingType::ScaleUp,
+                                                     arg_range.getIntMin(),
+                                                     abs(oper_dimen - ti_dimen))
+          : DateTimeUtils::get_datetime_scaled_epoch(
+                DateTimeUtils::ScalingType::ScaleDown,
+                arg_range.getIntMin(),
+                abs(oper_dimen - ti_dimen));
   const int64_t max_ts =
       ti_dimen > oper_dimen
-          ? DateTruncateAlterPrecisionScaleUp(arg_range.getIntMax(), scale)
-          : DateTruncateAlterPrecisionScaleDown(arg_range.getIntMax(), scale);
+          ? DateTimeUtils::get_datetime_scaled_epoch(DateTimeUtils::ScalingType::ScaleUp,
+                                                     arg_range.getIntMax(),
+                                                     abs(oper_dimen - ti_dimen))
+          : DateTimeUtils::get_datetime_scaled_epoch(
+                DateTimeUtils::ScalingType::ScaleDown,
+                arg_range.getIntMax(),
+                abs(oper_dimen - ti_dimen));
 
   return ExpressionRange::makeIntRange(min_ts, max_ts, 0, arg_range.hasNulls());
 }
@@ -872,6 +888,7 @@ ExpressionRange getExpressionRange(
           year_range_min, year_range_max, 0, arg_range.hasNulls());
     }
     case kEPOCH:
+    case kDATEEPOCH:
       return arg_range;
     case kQUARTERDAY:
     case kQUARTER:

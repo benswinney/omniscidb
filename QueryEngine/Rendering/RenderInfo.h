@@ -31,7 +31,6 @@ class RenderInfo {
  public:
   std::unique_ptr<RenderAllocatorMap> render_allocator_map_ptr;
   const std::shared_ptr<const ::QueryRenderer::RenderSession> render_session;
-  std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner;
 
   // Info for all the column targets retrieved in in a query. Used to extract column/table
   // info when rendering.
@@ -70,7 +69,8 @@ class RenderInfo {
   bool setInSituDataIfUnset(const bool is_in_situ_data);
 
   void reset(RenderQueryOptions in_query_opts,
-             const bool disallow_in_situ_only_if_final_ED_is_aggregate_in);
+             const bool in_force_non_in_situ_data,
+             const bool in_disallow_in_situ_only_if_final_ED_is_aggregate);
 
  private:
   enum class InSituState { UNSET, IS_IN_SITU, IS_NOT_IN_SITU };

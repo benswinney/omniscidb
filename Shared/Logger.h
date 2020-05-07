@@ -51,6 +51,9 @@
 
 #include <array>
 #include <sstream>
+#include <thread>
+
+extern bool g_enable_debug_timer;
 
 namespace logger {
 
@@ -102,7 +105,9 @@ using Channels = std::set<Channel>;
 // Filled by boost::program_options
 class LogOptions {
   std::string base_path_{"."};  // ignored if log_dir_ is absolute.
-  boost::program_options::options_description options_;
+  // boost::program_options::options_description is not copyable so unique_ptr
+  // allows for modification after initialization (e.g. changing default values.)
+  std::unique_ptr<boost::program_options::options_description> options_;
 
  public:
   // Initialize to default values
@@ -124,6 +129,7 @@ class LogOptions {
   boost::program_options::options_description const& get_options() const;
   void parse_command_line(int, char const* const*);
   void set_base_path(std::string const& base_path);
+  void set_options();
 };
 
 // Execute once in main() to initialize boost loggers.
@@ -138,7 +144,7 @@ struct LogShutdown {
 };
 
 // Optional pointer to function to call on LOG(FATAL).
-using FatalFunc = void (*)();
+using FatalFunc = void (*)() noexcept;
 void set_once_fatal_func(FatalFunc);
 
 using ChannelLogger = boost::log::sources::channel_logger_mt<Channel>;
@@ -183,6 +189,10 @@ inline bool fast_logging_check(Severity severity) {
   if (logger::fast_logging_check(logger::tag))               \
     if (auto _omnisci_logger_ = logger::Logger(logger::tag)) \
   _omnisci_logger_.stream(__FILE__, __LINE__)
+
+#define LOGGING(tag) logger::fast_logging_check(logger::tag)
+
+#define VLOGGING(n) logger::fast_logging_check(logger::DEBUG##n)
 
 #define CHECK(condition)            \
   if (BOOST_UNLIKELY(!(condition))) \
@@ -257,6 +267,10 @@ class NullLogger {
 
 #define LOG(severity) logger::NullLogger<logger::Severity::severity>()
 
+#define LOGGING(tag) false
+
+#define VLOGGING(n) false
+
 #define CHECK(condition) LOG_IF(FATAL, !(condition))
 
 #define CHECK_EQ(x, y) CHECK((x) == (y))
@@ -275,6 +289,31 @@ class NullLogger {
   LOG(severity)
 
 #define VLOG(n) LOG(DEBUG##n)
+
+class Duration;
+
+class DebugTimer {
+  Duration* duration_;
+
+ public:
+  DebugTimer(Severity, char const* file, int line, char const* name);
+  ~DebugTimer();
+  void stop();
+  // json is returned only when called on the root DurationTree.
+  std::string stopAndGetJson();
+};
+
+using ThreadId = uint64_t;
+
+void debug_timer_new_thread(ThreadId parent_thread_id);
+
+ThreadId thread_id();
+
+// Typical usage: auto timer = DEBUG_TIMER(__func__);
+#define DEBUG_TIMER(name) logger::DebugTimer(logger::INFO, __FILE__, __LINE__, name)
+
+#define DEBUG_TIMER_NEW_THREAD(parent_thread_id) \
+  logger::debug_timer_new_thread(parent_thread_id)
 
 }  // namespace logger
 

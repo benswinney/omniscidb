@@ -147,7 +147,7 @@ std::vector<TargetValue> ResultSet::getRowAt(
   for (size_t target_idx = 0; target_idx < storage_->targets_.size(); ++target_idx) {
     const auto& agg_info = storage_->targets_[target_idx];
     if (query_mem_desc_.didOutputColumnar()) {
-      if (!targets_to_skip.empty()) {
+      if (UNLIKELY(!targets_to_skip.empty())) {
         row.push_back(!targets_to_skip[target_idx]
                           ? getTargetValueFromBufferColwise(crt_col_ptr,
                                                             keys_ptr,
@@ -178,15 +178,29 @@ std::vector<TargetValue> ResultSet::getRowAt(
                                                 storage->query_mem_desc_,
                                                 separate_varlen_storage_valid_);
     } else {
-      row.push_back(getTargetValueFromBufferRowwise(rowwise_target_ptr,
-                                                    keys_ptr,
-                                                    global_entry_idx,
-                                                    agg_info,
-                                                    target_idx,
-                                                    agg_col_idx,
-                                                    translate_strings,
-                                                    decimal_to_double,
-                                                    fixup_count_distinct_pointers));
+      if (UNLIKELY(!targets_to_skip.empty())) {
+        row.push_back(!targets_to_skip[target_idx]
+                          ? getTargetValueFromBufferRowwise(rowwise_target_ptr,
+                                                            keys_ptr,
+                                                            global_entry_idx,
+                                                            agg_info,
+                                                            target_idx,
+                                                            agg_col_idx,
+                                                            translate_strings,
+                                                            decimal_to_double,
+                                                            fixup_count_distinct_pointers)
+                          : nullptr);
+      } else {
+        row.push_back(getTargetValueFromBufferRowwise(rowwise_target_ptr,
+                                                      keys_ptr,
+                                                      global_entry_idx,
+                                                      agg_info,
+                                                      target_idx,
+                                                      agg_col_idx,
+                                                      translate_strings,
+                                                      decimal_to_double,
+                                                      fixup_count_distinct_pointers));
+      }
       rowwise_target_ptr = advance_target_ptr_row_wise(rowwise_target_ptr,
                                                        agg_info,
                                                        agg_col_idx,
@@ -934,7 +948,9 @@ inline std::unique_ptr<ArrayDatum> lazy_fetch_chunk(const int8_t* ptr,
 
 struct GeoLazyFetchHandler {
   template <typename... T>
-  static inline auto fetch(const ResultSet::GeoReturnType return_type, T&&... vals) {
+  static inline auto fetch(const SQLTypeInfo& geo_ti,
+                           const ResultSet::GeoReturnType return_type,
+                           T&&... vals) {
     constexpr int num_vals = sizeof...(vals);
     static_assert(
         num_vals % 2 == 0,
@@ -944,7 +960,27 @@ struct GeoLazyFetchHandler {
     std::array<VarlenDatumPtr, num_vals / 2> ad_arr;
     size_t ctr = 0;
     for (const auto& col_pair : vals_vector) {
-      ad_arr[ctr++] = lazy_fetch_chunk(col_pair.first, col_pair.second);
+      ad_arr[ctr] = lazy_fetch_chunk(col_pair.first, col_pair.second);
+      // Regular chunk iterator used to fetch this datum sets the right nullness.
+      // That includes the fixlen bounds array.
+      // However it may incorrectly set it for the POINT coord array datum
+      // if 1st byte happened to hold NULL_ARRAY_TINYINT. One should either use
+      // the specialized iterator for POINT coords or rely on regular iterator +
+      // reset + recheck, which is what is done below.
+      auto is_point = (geo_ti.get_type() == kPOINT && ctr == 0);
+      if (is_point) {
+        // Resetting POINT coords array nullness here
+        ad_arr[ctr]->is_null = false;
+      }
+      if (!geo_ti.get_notnull()) {
+        // Recheck and set nullness
+        if (ad_arr[ctr]->length == 0 || ad_arr[ctr]->pointer == NULL ||
+            (is_point &&
+             is_null_point(geo_ti, ad_arr[ctr]->pointer, ad_arr[ctr]->length))) {
+          ad_arr[ctr]->is_null = true;
+        }
+      }
+      ctr++;
     }
     return ad_arr;
   }
@@ -957,12 +993,14 @@ inline std::unique_ptr<ArrayDatum> fetch_data_from_gpu(int64_t varlen_ptr,
   auto cpu_buf = std::shared_ptr<int8_t>(new int8_t[length], FreeDeleter());
   copy_from_gpu(
       data_mgr, cpu_buf.get(), static_cast<CUdeviceptr>(varlen_ptr), length, device_id);
+  // Just fetching the data from gpu, not checking geo nullness
   return std::make_unique<ArrayDatum>(length, cpu_buf, false);
 }
 
 struct GeoQueryOutputFetchHandler {
   static inline auto yieldGpuPtrFetcher() {
     return [](const int64_t ptr, const int64_t length) -> VarlenDatumPtr {
+      // Just fetching the data from gpu, not checking geo nullness
       return std::make_unique<VarlenDatum>(length, reinterpret_cast<int8_t*>(ptr), false);
     };
   }
@@ -977,12 +1015,14 @@ struct GeoQueryOutputFetchHandler {
 
   static inline auto yieldCpuDatumFetcher() {
     return [](const int64_t ptr, const int64_t length) -> VarlenDatumPtr {
+      // Just fetching the data from gpu, not checking geo nullness
       return std::make_unique<VarlenDatum>(length, reinterpret_cast<int8_t*>(ptr), false);
     };
   }
 
   template <typename... T>
-  static inline auto fetch(const ResultSet::GeoReturnType return_type,
+  static inline auto fetch(const SQLTypeInfo& geo_ti,
+                           const ResultSet::GeoReturnType return_type,
                            Data_Namespace::DataMgr* data_mgr,
                            const bool fetch_data_from_gpu,
                            const int device_id,
@@ -997,7 +1037,24 @@ struct GeoQueryOutputFetchHandler {
       std::array<VarlenDatumPtr, num_vals / 2> ad_arr;
       size_t ctr = 0;
       for (size_t i = 0; i < vals_vector.size(); i += 2) {
-        ad_arr[ctr++] = datum_fetcher(vals_vector[i], vals_vector[i + 1]);
+        ad_arr[ctr] = datum_fetcher(vals_vector[i], vals_vector[i + 1]);
+        // All fetched datums come in with is_null set to false
+        if (!geo_ti.get_notnull()) {
+          bool is_null = false;
+          // Now need to set the nullness
+          if (ad_arr[ctr]->length == 0 || ad_arr[ctr]->pointer == NULL) {
+            is_null = true;
+          } else if (geo_ti.get_type() == kPOINT && ctr == 0 &&
+                     is_null_point(geo_ti, ad_arr[ctr]->pointer, ad_arr[ctr]->length)) {
+            is_null = true;  // recognizes compressed and uncompressed points
+          } else if (ad_arr[ctr]->length == 4 * sizeof(double)) {
+            // Bounds
+            auto dti = SQLTypeInfo(kARRAY, 0, 0, false, kENCODING_NONE, 0, kDOUBLE);
+            is_null = dti.is_null_fixlen_array(ad_arr[ctr]->pointer, ad_arr[ctr]->length);
+          }
+          ad_arr[ctr]->is_null = is_null;
+        }
+        ctr++;
       }
       return ad_arr;
     };
@@ -1020,28 +1077,36 @@ struct GeoTargetValueBuilder {
   static inline TargetValue build(const SQLTypeInfo& geo_ti,
                                   const ResultSet::GeoReturnType return_type,
                                   T&&... vals) {
-    auto ad_arr = GeoTargetFetcher::fetch(return_type, std::forward<T>(vals)...);
+    auto ad_arr = GeoTargetFetcher::fetch(geo_ti, return_type, std::forward<T>(vals)...);
     static_assert(std::tuple_size<decltype(ad_arr)>::value > 0,
                   "ArrayDatum array for Geo Target must contain at least one value.");
 
+    // Fetcher sets the geo nullness based on geo typeinfo's notnull, type and
+    // compression. Serializers will generate appropriate NULL geo where necessary.
     switch (return_type) {
       case ResultSet::GeoReturnType::GeoTargetValue: {
-        if (ad_arr[0]->is_null) {
-          return ArrayTargetValue(boost::optional<std::vector<ScalarTargetValue>>{});
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          return GeoTargetValue();
         }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::GeoTargetValue,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
                                                                                   ad_arr);
       }
       case ResultSet::GeoReturnType::WktString: {
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          // May need to generate EMPTY wkt instead of NULL
+          return NullableString("NULL");
+        }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::WktString,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
                                                                                   ad_arr);
       }
       case ResultSet::GeoReturnType::GeoTargetValuePtr:
       case ResultSet::GeoReturnType::GeoTargetValueGpuPtr: {
-        if (ad_arr[0]->is_null) {
-          return GeoTargetValuePtr();
+        if (!geo_ti.get_notnull() && ad_arr[0]->is_null) {
+          // NULL geo
+          // Pass along null datum, instead of an empty/null GeoTargetValuePtr
+          // return GeoTargetValuePtr();
         }
         return GeoReturnTypeTraits<ResultSet::GeoReturnType::GeoTargetValuePtr,
                                    GEO_SOURCE_TYPE>::GeoSerializerType::serialize(geo_ti,
@@ -1124,9 +1189,13 @@ void ResultSet::copyColumnIntoBuffer(const size_t column_idx,
 
   // the appended storages:
   for (size_t i = 0; i < appended_storage_.size(); i++) {
-    CHECK_LT(out_buff_offset, output_buffer_size);
     const size_t crt_storage_row_count =
         appended_storage_[i]->query_mem_desc_.getEntryCount();
+    if (crt_storage_row_count == 0) {
+      // skip an empty appended storage
+      continue;
+    }
+    CHECK_LT(out_buff_offset, output_buffer_size);
     const size_t crt_buffer_size = crt_storage_row_count * column_width_size;
     const size_t column_offset =
         appended_storage_[i]->query_mem_desc_.getColOffInBytes(column_idx);
@@ -1139,27 +1208,150 @@ void ResultSet::copyColumnIntoBuffer(const size_t column_idx,
   }
 }
 
+template <typename ENTRY_TYPE, QueryDescriptionType QUERY_TYPE, bool COLUMNAR_FORMAT>
+ENTRY_TYPE ResultSet::getEntryAt(const size_t row_idx,
+                                 const size_t target_idx,
+                                 const size_t slot_idx) const {
+  if constexpr (QUERY_TYPE == QueryDescriptionType::GroupByPerfectHash) {  // NOLINT
+    if constexpr (COLUMNAR_FORMAT) {                                       // NOLINT
+      return getColumnarPerfectHashEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    } else {
+      return getRowWisePerfectHashEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    }
+  } else if constexpr (QUERY_TYPE == QueryDescriptionType::GroupByBaselineHash) {
+    if constexpr (COLUMNAR_FORMAT) {  // NOLINT
+      return getColumnarBaselineEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    } else {
+      return getRowWiseBaselineEntryAt<ENTRY_TYPE>(row_idx, target_idx, slot_idx);
+    }
+  } else {
+    UNREACHABLE() << "Invalid query type is used";
+    return 0;
+  }
+}
+
+#define DEF_GET_ENTRY_AT(query_type, columnar_output)                         \
+  template DATA_T ResultSet::getEntryAt<DATA_T, query_type, columnar_output>( \
+      const size_t row_idx, const size_t target_idx, const size_t slot_idx) const;
+
+#define DATA_T int64_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int32_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int16_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T int8_t
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T float
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#define DATA_T double
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByPerfectHash, false)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, true)
+DEF_GET_ENTRY_AT(QueryDescriptionType::GroupByBaselineHash, false)
+#undef DATA_T
+
+#undef DEF_GET_ENTRY_AT
+
 /**
- * For direct columnar conversion only
+ * Directly accesses the result set's storage buffer for a particular data type (columnar
+ * output, perfect hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
  */
 template <typename ENTRY_TYPE>
-ENTRY_TYPE ResultSet::getEntryAt(const size_t row_idx, const size_t column_idx) const {
-  const size_t column_offset = storage_->query_mem_desc_.getColOffInBytes(column_idx);
+ENTRY_TYPE ResultSet::getColumnarPerfectHashEntryAt(const size_t row_idx,
+                                                    const size_t target_idx,
+                                                    const size_t slot_idx) const {
+  const size_t column_offset = storage_->query_mem_desc_.getColOffInBytes(slot_idx);
   const int8_t* storage_buffer = storage_->getUnderlyingBuffer() + column_offset;
   return reinterpret_cast<const ENTRY_TYPE*>(storage_buffer)[row_idx];
 }
-template int64_t ResultSet::getEntryAt<int64_t>(const size_t row_idx,
-                                                const size_t column_idx) const;
-template int32_t ResultSet::getEntryAt<int32_t>(const size_t row_idx,
-                                                const size_t column_idx) const;
-template int16_t ResultSet::getEntryAt<int16_t>(const size_t row_idx,
-                                                const size_t column_idx) const;
-template int8_t ResultSet::getEntryAt<int8_t>(const size_t row_idx,
-                                              const size_t column_idx) const;
-template float ResultSet::getEntryAt<float>(const size_t row_idx,
-                                            const size_t column_idx) const;
-template double ResultSet::getEntryAt<double>(const size_t row_idx,
-                                              const size_t column_idx) const;
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (row-wise
+ * output, perfect hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getRowWisePerfectHashEntryAt(const size_t row_idx,
+                                                   const size_t target_idx,
+                                                   const size_t slot_idx) const {
+  const size_t row_offset = storage_->query_mem_desc_.getRowSize() * row_idx;
+  const size_t column_offset = storage_->query_mem_desc_.getColOffInBytes(slot_idx);
+  const int8_t* storage_buffer =
+      storage_->getUnderlyingBuffer() + row_offset + column_offset;
+  return *reinterpret_cast<const ENTRY_TYPE*>(storage_buffer);
+}
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (columnar
+ * output, baseline hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getRowWiseBaselineEntryAt(const size_t row_idx,
+                                                const size_t target_idx,
+                                                const size_t slot_idx) const {
+  CHECK_NE(storage_->query_mem_desc_.targetGroupbyIndicesSize(), size_t(0));
+  const auto key_width = storage_->query_mem_desc_.getEffectiveKeyWidth();
+  auto keys_ptr = row_ptr_rowwise(
+      storage_->getUnderlyingBuffer(), storage_->query_mem_desc_, row_idx);
+  const auto column_offset =
+      (storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) < 0)
+          ? storage_->query_mem_desc_.getColOffInBytes(slot_idx)
+          : storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) * key_width;
+  const auto storage_buffer = keys_ptr + column_offset;
+  return *reinterpret_cast<const ENTRY_TYPE*>(storage_buffer);
+}
+
+/**
+ * Directly accesses the result set's storage buffer for a particular data type (row-wise
+ * output, baseline hash group by)
+ *
+ * NOTE: Currently, only used in direct columnarization
+ */
+template <typename ENTRY_TYPE>
+ENTRY_TYPE ResultSet::getColumnarBaselineEntryAt(const size_t row_idx,
+                                                 const size_t target_idx,
+                                                 const size_t slot_idx) const {
+  CHECK_NE(storage_->query_mem_desc_.targetGroupbyIndicesSize(), size_t(0));
+  const auto key_width = storage_->query_mem_desc_.getEffectiveKeyWidth();
+  const auto column_offset =
+      (storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) < 0)
+          ? storage_->query_mem_desc_.getColOffInBytes(slot_idx)
+          : storage_->query_mem_desc_.getTargetGroupbyIndex(target_idx) * key_width *
+                storage_->query_mem_desc_.getEntryCount();
+  const auto column_buffer = storage_->getUnderlyingBuffer() + column_offset;
+  return reinterpret_cast<const ENTRY_TYPE*>(column_buffer)[row_idx];
+}
 
 // Interprets ptr1, ptr2 as the ptr and len pair used for variable length data.
 TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
@@ -1182,13 +1374,13 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     const auto storage_idx = getStorageIndex(entry_buff_idx);
     if (target_info.sql_type.is_string()) {
       CHECK(target_info.sql_type.get_compression() == kENCODING_NONE);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+      CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
       const auto& varlen_buffer_for_storage =
           serialized_varlen_buffer_[storage_idx.first];
       CHECK_LT(static_cast<size_t>(varlen_ptr), varlen_buffer_for_storage.size());
       return varlen_buffer_for_storage[varlen_ptr];
     } else if (target_info.sql_type.get_type() == kARRAY) {
-      CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+      CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
       const auto& varlen_buffer = serialized_varlen_buffer_[storage_idx.first];
       CHECK_LT(static_cast<size_t>(varlen_ptr), varlen_buffer.size());
 
@@ -1208,7 +1400,7 @@ TargetValue ResultSet::makeVarlenTargetValue(const int8_t* ptr1,
     const auto& col_lazy_fetch = lazy_fetch_info_[target_logical_idx];
     if (col_lazy_fetch.is_lazily_fetched) {
       const auto storage_idx = getStorageIndex(entry_buff_idx);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+      CHECK_LT(storage_idx.first, col_buffers_.size());
       auto& frag_col_buffers =
           getColumnFrag(storage_idx.first, target_logical_idx, varlen_ptr);
       bool is_end{false};
@@ -1382,7 +1574,7 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
 
   auto getFragColBuffers = [&]() -> decltype(auto) {
     const auto storage_idx = getStorageIndex(entry_buff_idx);
-    CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+    CHECK_LT(storage_idx.first, col_buffers_.size());
     auto global_idx = getCoordsDataPtr(geo_target_ptr);
     return getColumnFrag(storage_idx.first, target_logical_idx, global_idx);
   };
@@ -1398,7 +1590,7 @@ TargetValue ResultSet::makeGeoTargetValue(const int8_t* geo_target_ptr,
 
   auto getSeparateVarlenStorage = [&]() -> decltype(auto) {
     const auto storage_idx = getStorageIndex(entry_buff_idx);
-    CHECK_LT(static_cast<size_t>(storage_idx.first), serialized_varlen_buffer_.size());
+    CHECK_LT(storage_idx.first, serialized_varlen_buffer_.size());
     const auto& varlen_buffer = serialized_varlen_buffer_[storage_idx.first];
     return varlen_buffer;
   };
@@ -1603,7 +1795,8 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
     }
     if (target_info.is_agg &&
         (target_info.agg_kind == kAVG || target_info.agg_kind == kSUM ||
-         target_info.agg_kind == kMIN || target_info.agg_kind == kMAX)) {
+         target_info.agg_kind == kMIN || target_info.agg_kind == kMAX ||
+         target_info.agg_kind == kSINGLE_VALUE)) {
       // The above listed aggregates use two floats in a single 8-byte slot. Set the
       // padded size to 4 bytes to properly read each value.
       actual_compact_sz = sizeof(float);
@@ -1629,8 +1822,9 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
     if (col_lazy_fetch.is_lazily_fetched) {
       CHECK_GE(ival, 0);
       const auto storage_idx = getStorageIndex(entry_buff_idx);
-      CHECK_LT(static_cast<size_t>(storage_idx.first), col_buffers_.size());
+      CHECK_LT(storage_idx.first, col_buffers_.size());
       auto& frag_col_buffers = getColumnFrag(storage_idx.first, target_logical_idx, ival);
+      CHECK_LT(size_t(col_lazy_fetch.local_col_id), frag_col_buffers.size());
       ival = lazy_decode(
           col_lazy_fetch, frag_col_buffers[col_lazy_fetch.local_col_id], ival);
       if (chosen_type.is_fp()) {
@@ -1695,6 +1889,12 @@ TargetValue ResultSet::makeTargetValue(const int8_t* ptr,
   }
   if (chosen_type.is_decimal()) {
     if (decimal_to_double) {
+      if (target_info.is_agg &&
+          (target_info.agg_kind == kAVG || target_info.agg_kind == kSUM ||
+           target_info.agg_kind == kMIN || target_info.agg_kind == kMAX) &&
+          ival == inline_int_null_val(SQLTypeInfo(kBIGINT, false))) {
+        return NULL_DOUBLE;
+      }
       if (ival ==
           inline_int_null_val(SQLTypeInfo(decimal_to_int_type(chosen_type), false))) {
         return NULL_DOUBLE;
@@ -1954,7 +2154,7 @@ bool ResultSetStorage::isEmptyEntryColumnar(const size_t entry_idx,
     if (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
       return reinterpret_cast<const int64_t*>(buff)[entry_idx] == EMPTY_KEY_64;
     } else {
-      CHECK(query_mem_desc_.groupColWidthsSize() > 0);
+      CHECK(query_mem_desc_.getGroupbyColCount() > 0);
       const auto target_buff = buff + query_mem_desc_.getPrependedGroupColOffInBytes(0);
       switch (query_mem_desc_.groupColWidth(0)) {
         case 8:
@@ -1972,6 +2172,50 @@ bool ResultSetStorage::isEmptyEntryColumnar(const size_t entry_idx,
     return false;
   }
   return false;
+}
+
+namespace {
+
+template <typename T>
+inline size_t make_bin_search(size_t l, size_t r, T&& is_empty_fn) {
+  // Avoid search if there are no empty keys.
+  if (!is_empty_fn(r - 1)) {
+    return r;
+  }
+
+  --r;
+  while (l != r) {
+    size_t c = (l + r) / 2;
+    if (is_empty_fn(c)) {
+      r = c;
+    } else {
+      l = c + 1;
+    }
+  }
+
+  return r;
+}
+
+}  // namespace
+
+size_t ResultSetStorage::binSearchRowCount() const {
+  CHECK(query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection);
+  CHECK_EQ(query_mem_desc_.getEffectiveKeyWidth(), size_t(8));
+
+  if (!query_mem_desc_.getEntryCount()) {
+    return 0;
+  }
+
+  if (query_mem_desc_.didOutputColumnar()) {
+    return make_bin_search(0, query_mem_desc_.getEntryCount(), [this](size_t idx) {
+      return reinterpret_cast<const int64_t*>(buff_)[idx] == EMPTY_KEY_64;
+    });
+  } else {
+    return make_bin_search(0, query_mem_desc_.getEntryCount(), [this](size_t idx) {
+      const auto keys_ptr = row_ptr_rowwise(buff_, query_mem_desc_, idx);
+      return *reinterpret_cast<const int64_t*>(keys_ptr) == EMPTY_KEY_64;
+    });
+  }
 }
 
 bool ResultSetStorage::isEmptyEntry(const size_t entry_idx) const {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 MapD Technologies, Inc.
+ * Copyright 2019 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,8 +43,8 @@
 
 #include "Grantee.h"
 #include "LdapServer.h"
-#include "LinkDescriptor.h"
 #include "ObjectRoleDescriptor.h"
+#include "PkiServer.h"
 #include "RestServer.h"
 
 #include "../DataMgr/DataMgr.h"
@@ -67,28 +67,40 @@ namespace Catalog_Namespace {
 
 /*
  * @type UserMetadata
- * @brief metadata for a mapd user
+ * @brief metadata for a db user
  */
 struct UserMetadata {
-  UserMetadata(int32_t u, const std::string& n, const std::string& p, bool s, int32_t d)
+  UserMetadata(int32_t u,
+               const std::string& n,
+               const std::string& p,
+               bool s,
+               int32_t d,
+               bool l)
       : userId(u)
       , userName(n)
       , passwd_hash(p)
       , isSuper(s)
-      , isReallySuper(s)
-      , defaultDbId(d) {}
+      , defaultDbId(d)
+      , can_login(l) {}
   UserMetadata() {}
+  UserMetadata(UserMetadata const& user_meta)
+      : UserMetadata(user_meta.userId,
+                     user_meta.userName,
+                     user_meta.passwd_hash,
+                     user_meta.isSuper.load(),
+                     user_meta.defaultDbId,
+                     user_meta.can_login) {}
   int32_t userId;
   std::string userName;
   std::string passwd_hash;
-  bool isSuper;
-  bool isReallySuper;
+  std::atomic<bool> isSuper{false};
   int32_t defaultDbId;
+  bool can_login{true};
 };
 
 /*
  * @type DBMetadata
- * @brief metadata for a mapd database
+ * @brief metadata for a database
  */
 struct DBMetadata {
   DBMetadata() : dbId(0), dbOwner(0) {}
@@ -99,7 +111,7 @@ struct DBMetadata {
 
 /*
  * @type DBSummary
- * @brief summary info for a mapd database
+ * @brief summary info for a database
  */
 struct DBSummary {
   std::string dbName;
@@ -151,12 +163,14 @@ class SysCatalog : private CommonFileOperations {
   void createUser(const std::string& name,
                   const std::string& passwd,
                   bool issuper,
-                  const std::string& dbname);
+                  const std::string& dbname,
+                  bool can_login);
   void dropUser(const std::string& name);
   void alterUser(const int32_t userid,
                  const std::string* passwd,
                  bool* issuper,
-                 const std::string* dbname);
+                 const std::string* dbname,
+                 bool* can_login);
   void renameUser(std::string const& old_name, std::string const& new_name);
   void createDatabase(const std::string& dbname, int owner);
   void renameDatabase(std::string const& old_name, std::string const& new_name);
@@ -166,10 +180,10 @@ class SysCatalog : private CommonFileOperations {
   bool checkPasswordForUser(const std::string& passwd,
                             std::string& name,
                             UserMetadata& user);
-  void getMetadataWithDefault(std::string& dbname,
-                              const std::string& username,
-                              Catalog_Namespace::DBMetadata& db_meta,
-                              UserMetadata& user_meta);
+  void getMetadataWithDefaultDB(std::string& dbname,
+                                const std::string& username,
+                                Catalog_Namespace::DBMetadata& db_meta,
+                                UserMetadata& user_meta);
   bool getMetadataForDB(const std::string& name, DBMetadata& db);
   bool getMetadataForDBById(const int32_t idIn, DBMetadata& db);
   Data_Namespace::DataMgr& getDataMgr() const { return *dataMgr_; }
@@ -249,14 +263,15 @@ class SysCatalog : private CommonFileOperations {
   void renameObjectsInDescriptorMap(DBObject& object,
                                     const Catalog_Namespace::Catalog& cat);
   void syncUserWithRemoteProvider(const std::string& user_name,
-                                  const std::vector<std::string>& roles,
+                                  std::vector<std::string> idp_roles,
                                   bool* issuper);
   std::unordered_map<std::string, std::vector<std::string>> getGranteesOfSharedDashboards(
       const std::vector<std::string>& dashboard_ids);
+  void check_for_session_encryption(const std::string& pki_cert, std::string& session);
 
  private:
-  typedef std::map<std::string, Grantee*> GranteeMap;
-  typedef std::multimap<std::string, ObjectRoleDescriptor*> ObjectRoleDescriptorMap;
+  using GranteeMap = std::map<std::string, Grantee*>;
+  using ObjectRoleDescriptorMap = std::multimap<std::string, ObjectRoleDescriptor*>;
 
   SysCatalog()
       : CommonFileOperations(basePath_)
@@ -279,6 +294,7 @@ class SysCatalog : private CommonFileOperations {
   void updateUserSchema();
   void updatePasswordsToHashes();
   void updateBlankPasswordsToRandom();
+  void updateSupportUserDeactivation();
   void migrateDBAccessPrivileges();
 
   void loginImpl(std::string& username,
@@ -339,6 +355,7 @@ class SysCatalog : private CommonFileOperations {
   std::shared_ptr<Data_Namespace::DataMgr> dataMgr_;
   std::unique_ptr<LdapServer> ldap_server_;
   std::unique_ptr<RestServer> rest_server_;
+  std::unique_ptr<PkiServer> pki_server_;
   const AuthMetadata* authMetadata_;
   std::shared_ptr<Calcite> calciteMgr_;
   std::vector<LeafHostInfo> string_dict_hosts_;

@@ -9,6 +9,7 @@ hash yay || { echo >&2 "yay is required but is not installed. Aborting."; exit 1
 
 # Install all normal dependencies
 yay -S \
+    aws-sdk-cpp \
     blosc \
     boost \
     clang \
@@ -17,19 +18,22 @@ yay -S \
     doxygen \
     gcc \
     gdal \
+    geos \
     git \
     glbinding \
-    glslang \
     go \
     google-glog \
+    intel-tbb \
     jdk-openjdk \
     librdkafka \
     llvm \
     lz4 \
     maven \
+    ninja \
     python-numpy \
     snappy \
     thrift \
+    vulkan-headers \
     wget \
     zlib
 
@@ -47,6 +51,11 @@ rmdir $ARROW_PKG_DIR
 
 # Install SPIRV-Cross
 pushd arch/spirv-cross
+makepkg -cis
+popd
+
+# Install glslang
+pushd arch/glslang
 makepkg -cis
 popd
 

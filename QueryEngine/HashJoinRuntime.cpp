@@ -19,6 +19,7 @@
 #include "CompareKeysInl.h"
 #include "HashJoinKeyHandlers.h"
 #include "HyperLogLogRank.h"
+#include "JoinColumnIterator.h"
 #include "MurmurHash1Inl.h"
 #ifdef __CUDACC__
 #include "DecodersImpl.h"
@@ -127,8 +128,10 @@ DEVICE auto fill_hash_join_buff_impl(int32_t* buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    const size_t index = item.index;
+    int64_t elem = item.element;
     if (elem == type_info.null_val) {
       if (type_info.uses_bw_eq) {
         elem = type_info.translated_null_val;
@@ -150,7 +153,7 @@ DEVICE auto fill_hash_join_buff_impl(int32_t* buff,
         << "Element " << elem << " less than min val " << type_info.min_val;
 #endif
     int32_t* entry_ptr = slot_sel(elem);
-    if (mapd_cas(entry_ptr, invalid_slot_val, i) != invalid_slot_val) {
+    if (mapd_cas(entry_ptr, invalid_slot_val, index) != invalid_slot_val) {
       return -1;
     }
   }
@@ -221,8 +224,10 @@ DEVICE int fill_hash_join_buff_sharded_impl(int32_t* buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    const size_t index = item.index;
+    int64_t elem = item.element;
     size_t shard = SHARD_FOR_KEY(elem, shard_info.num_shards);
     if (shard != shard_info.shard) {
       continue;
@@ -248,7 +253,7 @@ DEVICE int fill_hash_join_buff_sharded_impl(int32_t* buff,
         << "Element " << elem << " less than min val " << type_info.min_val;
 #endif
     int32_t* entry_ptr = slot_sel(elem);
-    if (mapd_cas(entry_ptr, invalid_slot_val, i) != invalid_slot_val) {
+    if (mapd_cas(entry_ptr, invalid_slot_val, index) != invalid_slot_val) {
       return -1;
     }
   }
@@ -332,9 +337,10 @@ DEVICE void SUFFIX(init_baseline_hash_join_buff)(int8_t* hash_buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
+  auto hash_entry_size = (key_component_count + (with_val_slot ? 1 : 0)) * sizeof(T);
   const T empty_key = SUFFIX(get_invalid_key)<T>();
   for (uint32_t h = start; h < entry_count; h += step) {
-    uint32_t off = h * (key_component_count + (with_val_slot ? 1 : 0)) * sizeof(T);
+    uint32_t off = h * hash_entry_size;
     auto row_ptr = reinterpret_cast<T*>(hash_buff + off);
     for (size_t i = 0; i < key_component_count; ++i) {
       row_ptr[i] = empty_key;
@@ -351,8 +357,8 @@ __device__ T* get_matching_baseline_hash_slot_at(int8_t* hash_buff,
                                                  const uint32_t h,
                                                  const T* key,
                                                  const size_t key_component_count,
-                                                 const bool with_val_slot) {
-  uint32_t off = h * (key_component_count + (with_val_slot ? 1 : 0)) * sizeof(T);
+                                                 const size_t hash_entry_size) {
+  uint32_t off = h * hash_entry_size;
   auto row_ptr = reinterpret_cast<T*>(hash_buff + off);
   const T empty_key = SUFFIX(get_invalid_key)<T>();
   {
@@ -395,8 +401,8 @@ T* get_matching_baseline_hash_slot_at(int8_t* hash_buff,
                                       const uint32_t h,
                                       const T* key,
                                       const size_t key_component_count,
-                                      const bool with_val_slot) {
-  uint32_t off = h * (key_component_count + (with_val_slot ? 1 : 0)) * sizeof(T);
+                                      const size_t hash_entry_size) {
+  uint32_t off = h * hash_entry_size;
   auto row_ptr = reinterpret_cast<T*>(hash_buff + off);
   T empty_key = SUFFIX(get_invalid_key)<T>();
   T write_pending = SUFFIX(get_invalid_key)<T>() - 1;
@@ -437,16 +443,17 @@ DEVICE int write_baseline_hash_slot(const int32_t val,
                                     const T* key,
                                     const size_t key_component_count,
                                     const bool with_val_slot,
-                                    const int32_t invalid_slot_val) {
-  const uint32_t h =
-      MurmurHash1Impl(key, key_component_count * sizeof(T), 0) % entry_count;
+                                    const int32_t invalid_slot_val,
+                                    const size_t key_size_in_bytes,
+                                    const size_t hash_entry_size) {
+  const uint32_t h = MurmurHash1Impl(key, key_size_in_bytes, 0) % entry_count;
   T* matching_group = get_matching_baseline_hash_slot_at(
-      hash_buff, h, key, key_component_count, with_val_slot);
+      hash_buff, h, key, key_component_count, hash_entry_size);
   if (!matching_group) {
     uint32_t h_probe = (h + 1) % entry_count;
     while (h_probe != h) {
       matching_group = get_matching_baseline_hash_slot_at(
-          hash_buff, h_probe, key, key_component_count, with_val_slot);
+          hash_buff, h_probe, key, key_component_count, hash_entry_size);
       if (matching_group) {
         break;
       }
@@ -484,22 +491,33 @@ DEVICE int SUFFIX(fill_baseline_hash_join_buff)(int8_t* hash_buff,
 #endif
 
   T key_scratch_buff[g_maximum_conditions_to_coalesce];
-
-  auto key_buff_handler = [hash_buff, entry_count, with_val_slot, invalid_slot_val](
-                              const size_t entry_idx,
-                              const T* key_scratch_buffer,
-                              const size_t key_component_count) {
+  const size_t key_size_in_bytes = key_component_count * sizeof(T);
+  const size_t hash_entry_size =
+      (key_component_count + (with_val_slot ? 1 : 0)) * sizeof(T);
+  auto key_buff_handler = [hash_buff,
+                           entry_count,
+                           with_val_slot,
+                           invalid_slot_val,
+                           key_size_in_bytes,
+                           hash_entry_size](const size_t entry_idx,
+                                            const T* key_scratch_buffer,
+                                            const size_t key_component_count) {
     return write_baseline_hash_slot<T>(entry_idx,
                                        hash_buff,
                                        entry_count,
                                        key_scratch_buffer,
                                        key_component_count,
                                        with_val_slot,
-                                       invalid_slot_val);
+                                       invalid_slot_val,
+                                       key_size_in_bytes,
+                                       hash_entry_size);
   };
 
-  for (size_t i = start; i < num_elems; i += step) {
-    const auto err = (*f)(i, key_scratch_buff, key_buff_handler);
+  JoinColumnTuple cols(f->get_key_component_count(),
+                       f->get_join_columns(),
+                       f->get_join_column_type_infos());
+  for (auto& it : cols.slice(start, step)) {
+    const auto err = (*f)(it.join_column_iterators, key_scratch_buff, key_buff_handler);
     if (err) {
       return err;
     }
@@ -536,8 +554,9 @@ DEVICE void count_matches_impl(int32_t* count_buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    int64_t elem = item.element;
     if (elem == type_info.null_val) {
       if (type_info.uses_bw_eq) {
         elem = type_info.translated_null_val;
@@ -645,8 +664,9 @@ GLOBAL void SUFFIX(count_matches_sharded)(int32_t* count_buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    int64_t elem = item.element;
     if (elem == type_info.null_val) {
       if (type_info.uses_bw_eq) {
         elem = type_info.translated_null_val;
@@ -682,9 +702,9 @@ DEVICE NEVER_INLINE const T* SUFFIX(get_matching_baseline_hash_slot_readonly)(
     const T* key,
     const size_t key_component_count,
     const T* composite_key_dict,
-    const size_t entry_count) {
-  const uint32_t h =
-      MurmurHash1Impl(key, key_component_count * sizeof(T), 0) % entry_count;
+    const size_t entry_count,
+    const size_t key_size_in_bytes) {
+  const uint32_t h = MurmurHash1Impl(key, key_size_in_bytes, 0) % entry_count;
   uint32_t off = h * key_component_count;
   if (keys_are_equal(&composite_key_dict[off], key, key_component_count)) {
     return &composite_key_dict[off];
@@ -728,20 +748,29 @@ GLOBAL void SUFFIX(count_matches_baseline)(int32_t* count_buff,
   assert(composite_key_dict);
 #endif
   T key_scratch_buff[g_maximum_conditions_to_coalesce];
-
-  auto key_buff_handler = [composite_key_dict, entry_count, count_buff](
-                              const size_t row_entry_idx,
-                              const T* key_scratch_buff,
-                              const size_t key_component_count) {
-    const auto matching_group = SUFFIX(get_matching_baseline_hash_slot_readonly)(
-        key_scratch_buff, key_component_count, composite_key_dict, entry_count);
+  const size_t key_size_in_bytes = f->get_key_component_count() * sizeof(T);
+  auto key_buff_handler = [composite_key_dict,
+                           entry_count,
+                           count_buff,
+                           key_size_in_bytes](const size_t row_entry_idx,
+                                              const T* key_scratch_buff,
+                                              const size_t key_component_count) {
+    const auto matching_group =
+        SUFFIX(get_matching_baseline_hash_slot_readonly)(key_scratch_buff,
+                                                         key_component_count,
+                                                         composite_key_dict,
+                                                         entry_count,
+                                                         key_size_in_bytes);
     const auto entry_idx = (matching_group - composite_key_dict) / key_component_count;
     mapd_add(&count_buff[entry_idx], int32_t(1));
     return 0;
   };
 
-  for (size_t i = start; i < num_elems; i += step) {
-    (*f)(i, key_scratch_buff, key_buff_handler);
+  JoinColumnTuple cols(f->get_key_component_count(),
+                       f->get_join_columns(),
+                       f->get_join_column_type_infos());
+  for (auto& it : cols.slice(start, step)) {
+    (*f)(it.join_column_iterators, key_scratch_buff, key_buff_handler);
   }
 }
 
@@ -771,8 +800,10 @@ DEVICE void fill_row_ids_impl(int32_t* buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    const size_t index = item.index;
+    int64_t elem = item.element;
     if (elem == type_info.null_val) {
       if (type_info.uses_bw_eq) {
         elem = type_info.translated_null_val;
@@ -799,7 +830,7 @@ DEVICE void fill_row_ids_impl(int32_t* buff,
 #endif
     const auto bin_idx = pos_ptr - pos_buff;
     const auto id_buff_idx = mapd_add(count_buff + bin_idx, 1) + *pos_ptr;
-    id_buff[id_buff_idx] = static_cast<int32_t>(i);
+    id_buff[id_buff_idx] = static_cast<int32_t>(index);
   }
 }
 
@@ -898,8 +929,10 @@ DEVICE void fill_row_ids_sharded_impl(int32_t* buff,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column.num_elems; i += step) {
-    int64_t elem = get_join_column_element_value(type_info, join_column, i);
+  JoinColumnTyped col{&join_column, &type_info};
+  for (auto item : col.slice(start, step)) {
+    const size_t index = item.index;
+    int64_t elem = item.element;
     if (elem == type_info.null_val) {
       if (type_info.uses_bw_eq) {
         elem = type_info.translated_null_val;
@@ -926,7 +959,7 @@ DEVICE void fill_row_ids_sharded_impl(int32_t* buff,
 #endif
     const auto bin_idx = pos_ptr - pos_buff;
     const auto id_buff_idx = mapd_add(count_buff + bin_idx, 1) + *pos_ptr;
-    id_buff[id_buff_idx] = static_cast<int32_t>(i);
+    id_buff[id_buff_idx] = static_cast<int32_t>(index);
   }
 }
 
@@ -1039,17 +1072,22 @@ GLOBAL void SUFFIX(fill_row_ids_baseline)(int32_t* buff,
 #ifdef __CUDACC__
   assert(composite_key_dict);
 #endif
-
+  const size_t key_size_in_bytes = f->get_key_component_count() * sizeof(T);
   auto key_buff_handler = [composite_key_dict,
                            hash_entry_count,
                            pos_buff,
                            invalid_slot_val,
                            count_buff,
-                           id_buff](const size_t row_index,
-                                    const T* key_scratch_buff,
-                                    const size_t key_component_count) {
-    const T* matching_group = SUFFIX(get_matching_baseline_hash_slot_readonly)(
-        key_scratch_buff, key_component_count, composite_key_dict, hash_entry_count);
+                           id_buff,
+                           key_size_in_bytes](const size_t row_index,
+                                              const T* key_scratch_buff,
+                                              const size_t key_component_count) {
+    const T* matching_group =
+        SUFFIX(get_matching_baseline_hash_slot_readonly)(key_scratch_buff,
+                                                         key_component_count,
+                                                         composite_key_dict,
+                                                         hash_entry_count,
+                                                         key_size_in_bytes);
     const auto entry_idx = (matching_group - composite_key_dict) / key_component_count;
     int32_t* pos_ptr = pos_buff + entry_idx;
 #ifndef __CUDACC__
@@ -1061,8 +1099,11 @@ GLOBAL void SUFFIX(fill_row_ids_baseline)(int32_t* buff,
     return 0;
   };
 
-  for (size_t i = start; i < num_elems; i += step) {
-    (*f)(i, key_scratch_buff, key_buff_handler);
+  JoinColumnTuple cols(f->get_key_component_count(),
+                       f->get_join_columns(),
+                       f->get_join_column_type_infos());
+  for (auto& it : cols.slice(start, step)) {
+    (*f)(it.join_column_iterators, key_scratch_buff, key_buff_handler);
   }
   return;
 }
@@ -1111,8 +1152,12 @@ GLOBAL void SUFFIX(approximate_distinct_tuples_impl)(uint8_t* hll_buffer,
   };
 
   int64_t key_scratch_buff[g_maximum_conditions_to_coalesce];
-  for (size_t i = start; i < num_elems; i += step) {
-    (*f)(i, key_scratch_buff, key_buff_handler);
+
+  JoinColumnTuple cols(f->get_key_component_count(),
+                       f->get_join_columns(),
+                       f->get_join_column_type_infos());
+  for (auto& it : cols.slice(start, step)) {
+    (*f)(it.join_column_iterators, key_scratch_buff, key_buff_handler);
   }
 }
 
@@ -1139,6 +1184,7 @@ __device__ double atomicMin(double* address, double val) {
 template <size_t N>
 GLOBAL void SUFFIX(compute_bucket_sizes_impl)(double* bucket_sizes_for_thread,
                                               const JoinColumn* join_column,
+                                              const JoinColumnTypeInfo* type_info,
                                               const double bucket_sz_threshold,
                                               const int32_t cpu_thread_idx,
                                               const int32_t cpu_thread_count) {
@@ -1149,12 +1195,12 @@ GLOBAL void SUFFIX(compute_bucket_sizes_impl)(double* bucket_sizes_for_thread,
   int32_t start = cpu_thread_idx;
   int32_t step = cpu_thread_count;
 #endif
-  for (size_t i = start; i < join_column->num_elems; i += step) {
-    // We exepct the bounds column to be (min, max) e.g. (x_min, y_min, x_max, y_max)
+  JoinColumnIterator it(join_column, type_info, start, step);
+  for (; it; ++it) {
+    // We expect the bounds column to be (min, max) e.g. (x_min, y_min, x_max, y_max)
     double bounds[2 * N];
     for (size_t j = 0; j < 2 * N; j++) {
-      bounds[j] = SUFFIX(fixed_width_double_decode_noinline)(join_column->col_buff,
-                                                             2 * N * i + j);
+      bounds[j] = SUFFIX(fixed_width_double_decode_noinline)(it.ptr(), j);
     }
 
     for (size_t j = 0; j < N; j++) {
@@ -1986,6 +2032,7 @@ void approximate_distinct_tuples_overlaps(
 
 void compute_bucket_sizes(std::vector<double>& bucket_sizes_for_dimension,
                           const JoinColumn& join_column,
+                          const JoinColumnTypeInfo& type_info,
                           const double bucket_size_threshold,
                           const int thread_count) {
   std::vector<std::vector<double>> bucket_sizes_for_threads;
@@ -1999,6 +2046,7 @@ void compute_bucket_sizes(std::vector<double>& bucket_sizes_for_dimension,
                                  compute_bucket_sizes_impl<2>,
                                  bucket_sizes_for_threads[thread_idx].data(),
                                  &join_column,
+                                 &type_info,
                                  bucket_size_threshold,
                                  thread_idx,
                                  thread_count));
@@ -2016,4 +2064,4 @@ void compute_bucket_sizes(std::vector<double>& bucket_sizes_for_dimension,
   }
 }
 
-#endif
+#endif  // ifndef __CUDACC__

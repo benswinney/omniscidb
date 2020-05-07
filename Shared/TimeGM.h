@@ -31,9 +31,9 @@
 
 class TimeGM {
  public:
-  time_t my_timegm(const struct tm* tm);
-  time_t my_timegm(const struct tm* tm, const time_t fsc, const int32_t dimen);
-  time_t my_timegm_days(const struct tm* tm);
+  time_t my_timegm(tm const* tm);
+  time_t my_timegm(tm const* tm, const time_t fsc, const int32_t dimen);
+  time_t my_timegm_days(tm const* tm);
   time_t parse_fractional_seconds(uint64_t sfrac,
                                   const int32_t ntotal,
                                   const int32_t dimen);
@@ -47,6 +47,10 @@ class TimeGM {
   }
 
  private:
+  time_t get_overflow_underflow_safe_epoch(tm const* tm,
+                                           const time_t fsc,
+                                           const int32_t dimen);
+
   /* Number of days per month (except for February in leap years). */
   const int monoff[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
   int is_leap_year(int year);
@@ -68,9 +72,9 @@ class DateTimeStringValidate {
  private:
   constexpr int64_t parseDateTimeString() {
     char* tp = nullptr;
-    if constexpr (SQL_TYPE == kTIME) {
-      tm_.tm_hour = tm_.tm_min = tm_.tm_sec = -1;
-      parseTimePart<const char*>(str_.c_str(), tp);
+    if constexpr (SQL_TYPE == kTIME) {  // NOLINT
+      char const* x = str_.c_str();
+      parseTimePart(x, tp);
       tm_.tm_mday = 1;
       tm_.tm_mon = 0;
       tm_.tm_year = 70;
@@ -82,8 +86,8 @@ class DateTimeStringValidate {
       return getEpochValue();
     }
     char* p = nullptr;
-    parseTimePart<char*&>(tp, p);
-    if constexpr (SQL_TYPE == kDATE) {
+    parseTimePart(tp, p);
+    if constexpr (SQL_TYPE == kDATE) {  // NOLINT
       return static_cast<int64_t>(TimeGM::instance().my_timegm(&tm_));
     }
     // handle fractional seconds
@@ -107,16 +111,19 @@ class DateTimeStringValidate {
   }
 
   template <typename T>
-  constexpr void parseTimePart(T s, char*& p) {
-    if constexpr (SQL_TYPE == kDATE) {
+  constexpr void parseTimePart(T*& s, std::remove_const_t<T>*& p) {
+    if constexpr (SQL_TYPE == kDATE) {  // NOLINT
       if (*s == 'T' || *s == ' ') {
         ++s;
       }
       detectFormatFromString(s, p, "%z");
       return;
-    } else if constexpr (SQL_TYPE == kTIME) {
+    } else if constexpr (SQL_TYPE == kTIME) {  // NOLINT
+      if (*s == 'T') {
+        ++s;
+      }
       detectFormatFromString(s, p, "%T %z", "%T", "%H%M%S", "%R");
-      if (tm_.tm_hour == -1 || tm_.tm_min == -1 || tm_.tm_sec == -1) {
+      if (!p) {
         throw std::runtime_error("Invalid TIME string " + str_);
       }
       return;
@@ -186,10 +193,11 @@ class DateTimeStringValidate {
   }
 
   template <typename EVAL_STRING, typename TARGET_CHAR, typename... EVAL_FORMATS>
-  inline void detectFormatFromString(EVAL_STRING s,
+  inline auto detectFormatFromString(EVAL_STRING s,
                                      TARGET_CHAR& p,
                                      EVAL_FORMATS... eval_formats) {
     ((p = strptime(s, eval_formats, &tm_)) || ...);
+    return;
   }
 
   std::string str_;

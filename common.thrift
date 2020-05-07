@@ -1,4 +1,4 @@
-namespace java com.mapd.thrift.server
+namespace java com.omnisci.thrift.server
 namespace py omnisci.common
 
 enum TDeviceType {
@@ -37,7 +37,8 @@ enum TEncodingType {
   DICT,
   SPARSE,
   GEOINT,
-  DATE_IN_DAYS
+  DATE_IN_DAYS,
+  PACKED_PIXEL_COORD
 }
 
 struct TTypeInfo {
@@ -50,3 +51,4 @@ struct TTypeInfo {
   7: i32 comp_param,
   8: optional i32 size=-1
 }
+

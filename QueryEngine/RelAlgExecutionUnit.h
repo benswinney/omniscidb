@@ -29,16 +29,18 @@
 #include "../Shared/sqldefs.h"
 #include "Descriptors/InputDescriptors.h"
 #include "QueryFeatures.h"
+#include "ThriftHandler/QueryState.h"
 
 #include <list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 enum class SortAlgorithm { Default, SpeculativeTopN, StreamingTopN };
 
 namespace Analyzer {
-
 class Expr;
+class ColumnVar;
 class Estimator;
 struct OrderEntry;
 
@@ -59,7 +61,7 @@ struct JoinCondition {
 using JoinQualsPerNestingLevel = std::vector<JoinCondition>;
 
 struct RelAlgExecutionUnit {
-  const std::vector<InputDescriptor> input_descs;
+  std::vector<InputDescriptor> input_descs;
   std::list<std::shared_ptr<const InputColDescriptor>> input_col_descs;
   std::list<std::shared_ptr<Analyzer::Expr>> simple_quals;
   std::list<std::shared_ptr<Analyzer::Expr>> quals;
@@ -71,6 +73,21 @@ struct RelAlgExecutionUnit {
   size_t scan_limit;
   QueryFeatureDescriptor query_features;
   bool use_bump_allocator{false};
+  // empty if not a UNION, true if UNION ALL, false if regular UNION
+  const std::optional<bool> union_all;
+  std::shared_ptr<const query_state::QueryState> query_state;
+};
+
+std::ostream& operator<<(std::ostream& os, const RelAlgExecutionUnit& ra_exe_unit);
+
+struct TableFunctionExecutionUnit {
+  const std::vector<InputDescriptor> input_descs;
+  std::list<std::shared_ptr<const InputColDescriptor>> input_col_descs;
+  std::vector<Analyzer::Expr*> input_exprs;
+  std::vector<Analyzer::ColumnVar*> table_func_inputs;
+  std::vector<Analyzer::Expr*> target_exprs;
+  const std::optional<size_t> output_buffer_multiplier;
+  const std::string table_func_name;
 };
 
 class ResultSet;

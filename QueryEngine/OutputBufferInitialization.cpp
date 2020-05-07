@@ -22,11 +22,9 @@
 #include "../Analyzer/Analyzer.h"
 
 extern bool g_bigint_count;
-namespace {
 
-inline std::vector<int64_t> init_agg_val_vec(
-    const std::vector<TargetInfo>& targets,
-    const QueryMemoryDescriptor& query_mem_desc) {
+std::vector<int64_t> init_agg_val_vec(const std::vector<TargetInfo>& targets,
+                                      const QueryMemoryDescriptor& query_mem_desc) {
   std::vector<int64_t> agg_init_vals;
   agg_init_vals.reserve(query_mem_desc.getSlotCount());
   const bool is_group_by{query_mem_desc.isGroupBy()};
@@ -83,8 +81,6 @@ inline std::vector<int64_t> init_agg_val_vec(
   return agg_init_vals;
 }
 
-}  // namespace
-
 std::pair<int64_t, int64_t> inline_int_max_min(const size_t byte_width) {
   switch (byte_width) {
     case 1:
@@ -128,7 +124,7 @@ int64_t get_agg_initial_val(const SQLAgg agg,
                             const SQLTypeInfo& ti,
                             const bool enable_compaction,
                             const unsigned min_byte_width_to_compact) {
-  CHECK(!ti.is_string() || agg == kSAMPLE);
+  CHECK(!ti.is_string() || (agg == kSINGLE_VALUE || agg == kSAMPLE));
   const auto byte_width =
       enable_compaction
           ? compact_byte_width(static_cast<unsigned>(get_bit_width(ti) >> 3),
@@ -215,6 +211,7 @@ int64_t get_agg_initial_val(const SQLAgg agg,
           CHECK(false);
       }
     }
+    case kSINGLE_VALUE:
     case kSAMPLE:
     case kMAX: {
       switch (byte_width) {
@@ -276,8 +273,8 @@ std::vector<int64_t> init_agg_val_vec(
       if (query_mem_desc.getQueryDescriptionType() ==
               QueryDescriptionType::NonGroupedAggregate &&
           target.is_agg &&
-          (target.agg_kind == kMIN ||
-           target.agg_kind == kMAX)) {  // TODO(alex): fix SUM and AVG as well
+          (target.agg_kind == kMIN || target.agg_kind == kMAX ||
+           target.agg_kind == kSUM || target.agg_kind == kAVG)) {
         set_notnull(target, false);
       } else if (constrained_not_null(arg_expr, quals)) {
         set_notnull(target, true);
@@ -295,7 +292,7 @@ const Analyzer::Expr* agg_arg(const Analyzer::Expr* expr) {
 
 bool constrained_not_null(const Analyzer::Expr* expr,
                           const std::list<std::shared_ptr<Analyzer::Expr>>& quals) {
-  for (const auto qual : quals) {
+  for (const auto& qual : quals) {
     auto uoper = std::dynamic_pointer_cast<Analyzer::UOper>(qual);
     if (!uoper) {
       continue;

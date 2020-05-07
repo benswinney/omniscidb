@@ -19,8 +19,10 @@ package org.apache.calcite.rel.externalize;
 import com.google.common.collect.ImmutableList;
 
 import org.apache.calcite.adapter.enumerable.EnumerableTableScan;
+import org.apache.calcite.avatica.util.Spaces;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
+import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.apache.calcite.rel.logical.LogicalTableModify;
 import org.apache.calcite.rel.logical.LogicalTableScan;
@@ -28,11 +30,23 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.util.JsonBuilder;
 import org.apache.calcite.util.Pair;
+import org.apache.commons.text.StringEscapeUtils;
 
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+
+final class EscapedStringJsonBuilder extends JsonBuilder {
+  @Override
+  public void append(StringBuilder buf, int indent, Object o) {
+    if (o instanceof String) {
+      buf.append('"').append(StringEscapeUtils.escapeJson((String) o)).append('"');
+    } else {
+      super.append(buf, indent, o);
+    }
+  }
+}
 
 /**
  * Callback for a relational expression to dump itself as JSON.
@@ -42,7 +56,7 @@ import java.util.Map;
 public class MapDRelJsonWriter implements RelWriter {
   //~ Instance fields ----------------------------------------------------------
 
-  private final JsonBuilder jsonBuilder;
+  private final EscapedStringJsonBuilder jsonBuilder;
   private final MapDRelJson relJson;
   private final Map<RelNode, String> relIdMap = new IdentityHashMap<RelNode, String>();
   private final List<Object> relList;
@@ -52,7 +66,7 @@ public class MapDRelJsonWriter implements RelWriter {
   //~ Constructors -------------------------------------------------------------
 
   public MapDRelJsonWriter() {
-    jsonBuilder = new JsonBuilder();
+    jsonBuilder = new EscapedStringJsonBuilder();
     relList = jsonBuilder.list();
     relJson = new MapDRelJson(jsonBuilder);
   }
@@ -64,8 +78,8 @@ public class MapDRelJsonWriter implements RelWriter {
 
     map.put("id", null); // ensure that id is the first attribute
     map.put("relOp", relJson.classToTypeName(rel.getClass()));
-    if (rel instanceof EnumerableTableScan) {
-      RelDataType row_type = ((EnumerableTableScan) rel).getTable().getRowType();
+    if (rel instanceof TableScan) {
+      RelDataType row_type = ((TableScan) rel).getTable().getRowType();
       List<String> field_names = row_type.getFieldNames();
       map.put("fieldNames", field_names);
     }

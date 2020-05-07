@@ -43,9 +43,13 @@ Debug/
 
 # VS code settings files
 .vscode/
+*.code-workspace
 
 # VIM editor files
 .*.swp
+
+# Emacs editor files
+*~
 
 # Thrift-generated files
 java/src/gen/
@@ -65,6 +69,8 @@ ThirdParty/go/src/*
 *.pyc
 docs/build/
 docs/generated-docs/
+docs/sphinx-env
+docs/source/api/*
 
 # java-generated files
 java/**/target/
@@ -73,3 +79,8 @@ java/thrift/src/
 *.project
 
 ThirdParty/
+data/
+
+# IntelliJ/CLion settings files
+.idea
+*.iml

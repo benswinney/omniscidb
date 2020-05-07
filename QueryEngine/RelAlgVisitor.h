@@ -17,7 +17,7 @@
 #ifndef QUERYENGINE_RELALGVISITOR_H
 #define QUERYENGINE_RELALGVISITOR_H
 
-#include "RelAlgAbstractInterpreter.h"
+#include "RelAlgDagBuilder.h"
 
 template <class T>
 class RelAlgVisitor {
@@ -67,8 +67,16 @@ class RelAlgVisitor {
     if (modify) {
       return aggregateResult(result, visitModify(modify));
     }
-    CHECK(false);
-    return defaultResult();
+    const auto table_func = dynamic_cast<const RelTableFunction*>(rel_alg);
+    if (table_func) {
+      return aggregateResult(result, visitTableFunction(table_func));
+    }
+    const auto logical_union = dynamic_cast<const RelLogicalUnion*>(rel_alg);
+    if (logical_union) {
+      return aggregateResult(result, visitLogicalUnion(logical_union));
+    }
+    LOG(FATAL) << "Unhandled rel_alg type: " << rel_alg->toString();
+    return {};
   }
 
   virtual T visitAggregate(const RelAggregate*) const { return defaultResult(); }
@@ -92,6 +100,10 @@ class RelAlgVisitor {
   virtual T visitLogicalValues(const RelLogicalValues*) const { return defaultResult(); }
 
   virtual T visitModify(const RelModify*) const { return defaultResult(); }
+
+  virtual T visitTableFunction(const RelTableFunction*) const { return defaultResult(); }
+
+  virtual T visitLogicalUnion(const RelLogicalUnion*) const { return defaultResult(); }
 
  protected:
   virtual T aggregateResult(const T& aggregate, const T& next_result) const {

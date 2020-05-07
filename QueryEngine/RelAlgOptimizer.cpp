@@ -149,10 +149,13 @@ bool is_identical_copy(
       }
       if (dynamic_cast<const RelAggregate*>(only_usr) ||
           dynamic_cast<const RelSort*>(only_usr) ||
-          dynamic_cast<const RelJoin*>(only_usr)) {
+          dynamic_cast<const RelJoin*>(only_usr) ||
+          dynamic_cast<const RelTableFunction*>(only_usr) ||
+          dynamic_cast<const RelLogicalUnion*>(only_usr)) {
         return false;
       }
-      CHECK(dynamic_cast<const RelFilter*>(only_usr));
+      CHECK(dynamic_cast<const RelFilter*>(only_usr))
+          << "only_usr: " << only_usr->toString();
       usrs_it = du_web.find(only_usr);
       CHECK(usrs_it != du_web.end());
     }
@@ -187,8 +190,7 @@ bool is_identical_copy(
 void propagate_rex_input_renumber(
     const RelFilter* excluded_root,
     const std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>>&
-        du_web,
-    const std::unordered_map<const RelAlgNode*, RelAlgNode*>& deconst_mapping) {
+        du_web) {
   CHECK(excluded_root);
   auto src_project = dynamic_cast<const RelProject*>(excluded_root->getInput(0));
   CHECK(src_project && src_project->isSimple());
@@ -213,9 +215,7 @@ void propagate_rex_input_renumber(
   while (!work_set.empty()) {
     auto node = work_set.back();
     work_set.pop_back();
-    auto node_it = deconst_mapping.find(node);
-    CHECK(node_it != deconst_mapping.end());
-    auto modified_node = node_it->second;
+    auto modified_node = const_cast<RelAlgNode*>(node);
     if (auto filter = dynamic_cast<RelFilter*>(modified_node)) {
       auto new_condition = renumber.visit(filter->getCondition());
       filter->setCondition(new_condition);
@@ -236,13 +236,16 @@ void propagate_rex_input_renumber(
   }
 }
 
+// This function appears to redirect/remove redundant Projection input nodes(?)
 void redirect_inputs_of(
     std::shared_ptr<RelAlgNode> node,
     const std::unordered_set<const RelProject*>& projects,
     const std::unordered_set<const RelProject*>& permutating_projects,
     const std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>>&
-        du_web,
-    const std::unordered_map<const RelAlgNode*, RelAlgNode*>& deconst_mapping) {
+        du_web) {
+  if (dynamic_cast<RelLogicalUnion*>(node.get())) {
+    return;  // UNION keeps all Projection inputs.
+  }
   std::shared_ptr<const RelProject> src_project = nullptr;
   for (size_t i = 0; i < node->inputCount(); ++i) {
     if (auto project =
@@ -293,7 +296,7 @@ void redirect_inputs_of(
     const bool is_permutating_proj = permutating_projects.count(src_project.get());
     if (is_permutating_proj || dynamic_cast<const RelJoin*>(src_project->getInput(0))) {
       if (is_permutating_proj) {
-        propagate_rex_input_renumber(filter.get(), du_web, deconst_mapping);
+        propagate_rex_input_renumber(filter.get(), du_web);
       }
       filter->RelAlgNode::replaceInput(src_project, src_project->getAndOwnInput(0));
       RexProjectInputRedirector redirector(projects);
@@ -304,9 +307,13 @@ void redirect_inputs_of(
     }
     return;
   }
-  if (std::dynamic_pointer_cast<RelSort>(node) &&
-      dynamic_cast<const RelScan*>(src_project->getInput(0))) {
-    return;
+  if (std::dynamic_pointer_cast<RelSort>(node)) {
+    auto const src_project_input = src_project->getInput(0);
+    if (dynamic_cast<const RelScan*>(src_project_input) ||
+        dynamic_cast<const RelLogicalValues*>(src_project_input) ||
+        dynamic_cast<const RelLogicalUnion*>(src_project_input)) {
+      return;
+    }
   }
   if (std::dynamic_pointer_cast<RelModify>(node)) {
     return;  // NOTE:  Review this.  Not sure about this.
@@ -353,7 +360,17 @@ std::unordered_set<const RelProject*> get_visible_projects(const RelAlgNode* roo
     return lhs_projs;
   }
 
-  CHECK(dynamic_cast<const RelFilter*>(root) || dynamic_cast<const RelSort*>(root));
+  if (auto logical_union = dynamic_cast<const RelLogicalUnion*>(root)) {
+    auto projections = get_visible_projects(logical_union->getInput(0));
+    for (size_t i = 1; i < logical_union->inputCount(); ++i) {
+      auto next = get_visible_projects(logical_union->getInput(i));
+      projections.insert(next.begin(), next.end());
+    }
+    return projections;
+  }
+
+  CHECK(dynamic_cast<const RelFilter*>(root) || dynamic_cast<const RelSort*>(root))
+      << "root = " << root->toString();
   return get_visible_projects(root->getInput(0));
 }
 
@@ -409,15 +426,15 @@ std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>> bui
           web.insert(std::make_pair(walker, std::unordered_set<const RelAlgNode*>{}));
       CHECK(it_ok.second);
       visited.insert(walker);
-      const auto join = dynamic_cast<const RelJoin*>(walker);
-      const auto project = dynamic_cast<const RelProject*>(walker);
-      const auto aggregate = dynamic_cast<const RelAggregate*>(walker);
-      const auto filter = dynamic_cast<const RelFilter*>(walker);
-      const auto sort = dynamic_cast<const RelSort*>(walker);
-      const auto left_deep_join = dynamic_cast<const RelLeftDeepInnerJoin*>(walker);
-      const auto logical_values = dynamic_cast<const RelLogicalValues*>(walker);
-      CHECK(join || project || aggregate || filter || sort || left_deep_join ||
-            logical_values);
+      CHECK(dynamic_cast<const RelJoin*>(walker) ||
+            dynamic_cast<const RelProject*>(walker) ||
+            dynamic_cast<const RelAggregate*>(walker) ||
+            dynamic_cast<const RelFilter*>(walker) ||
+            dynamic_cast<const RelSort*>(walker) ||
+            dynamic_cast<const RelLeftDeepInnerJoin*>(walker) ||
+            dynamic_cast<const RelLogicalValues*>(walker) ||
+            dynamic_cast<const RelTableFunction*>(walker) ||
+            dynamic_cast<const RelLogicalUnion*>(walker));
       for (size_t i = 0; i < walker->inputCount(); ++i) {
         auto src = walker->getInput(i);
         if (dynamic_cast<const RelScan*>(src) || dynamic_cast<const RelModify*>(src)) {
@@ -432,6 +449,34 @@ std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>> bui
     }
   }
   return web;
+}
+
+/**
+ * Return true if the input project separates two sort nodes, i.e. Sort -> Project ->
+ * Sort. This pattern often occurs in machine generated SQL, e.g. SELECT * FROM (SELECT *
+ * FROM t LIMIT 10) t0 LIMIT 1;
+ * Use this function to prevent optimizing out the intermediate project, as the project is
+ * required to ensure the first sort runs to completion prior to the second sort. Back to
+ * back sort nodes are not executable and will throw an error.
+ */
+bool project_separates_sort(const RelProject* project, const RelAlgNode* next_node) {
+  CHECK(project);
+  if (!next_node) {
+    return false;
+  }
+
+  auto sort = dynamic_cast<const RelSort*>(next_node);
+  if (!sort) {
+    return false;
+  }
+  if (!(project->inputCount() == 1)) {
+    return false;
+  }
+
+  if (dynamic_cast<const RelSort*>(project->getInput(0))) {
+    return true;
+  }
+  return false;
 }
 
 // For now, the only target to eliminate is restricted to project-aggregate pair between
@@ -484,25 +529,24 @@ void eliminate_identical_copy(std::vector<std::shared_ptr<RelAlgNode>>& nodes) n
 
   auto web = build_du_web(nodes);
 
-  std::unordered_map<const RelAlgNode*, RelAlgNode*> deconst_mapping;
-  for (auto node : nodes) {
-    deconst_mapping.insert(std::make_pair(node.get(), node.get()));
-  }
-
   std::unordered_set<const RelProject*> projects;
   std::unordered_set<const RelProject*> permutating_projects;
-  auto visible_projs = get_visible_projects(nodes.back().get());
-  for (auto node : nodes) {
+  auto const visible_projs = get_visible_projects(nodes.back().get());
+  for (auto node_it = nodes.begin(); node_it != nodes.end(); node_it++) {
+    auto node = *node_it;
     auto project = std::dynamic_pointer_cast<RelProject>(node);
+    auto next_node_it = std::next(node_it);
     if (project && project->isSimple() &&
         (!visible_projs.count(project.get()) || !project->isRenaming()) &&
-        is_identical_copy(project.get(), web, projects, permutating_projects)) {
+        is_identical_copy(project.get(), web, projects, permutating_projects) &&
+        !project_separates_sort(
+            project.get(), next_node_it == nodes.end() ? nullptr : next_node_it->get())) {
       projects.insert(project.get());
     }
   }
 
   for (auto node : nodes) {
-    redirect_inputs_of(node, projects, permutating_projects, web, deconst_mapping);
+    redirect_inputs_of(node, projects, permutating_projects, web);
   }
 
   cleanup_dead_nodes(nodes);
@@ -675,6 +719,19 @@ std::vector<std::unordered_set<size_t>> get_live_ins(
       live_in.insert(static_cast<size_t>(rex_in.getIndex()));
     }
     return {live_in};
+  }
+  if (auto table_func = dynamic_cast<const RelTableFunction*>(node)) {
+    CHECK_EQ(size_t(1), table_func->inputCount());
+
+    const auto input_count = table_func->size();
+    std::unordered_set<size_t> live_in;
+    for (size_t i = 0; i < input_count; i++) {
+      live_in.insert(i);
+    }
+    return {live_in};
+  }
+  if (auto logical_union = dynamic_cast<const RelLogicalUnion*>(node)) {
+    return std::vector<std::unordered_set<size_t>>(logical_union->inputCount(), live_out);
   }
   return {};
 }
@@ -917,8 +974,8 @@ std::string get_field_name(const RelAlgNode* node, size_t index) {
 void try_insert_coalesceable_proj(
     std::vector<std::shared_ptr<RelAlgNode>>& nodes,
     std::unordered_map<const RelAlgNode*, std::unordered_set<size_t>>& liveouts,
-    std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>>& du_web,
-    std::unordered_map<const RelAlgNode*, RelAlgNode*>& deconst_mapping) {
+    std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>>&
+        du_web) {
   std::vector<std::shared_ptr<RelAlgNode>> new_nodes;
   for (auto node : nodes) {
     new_nodes.push_back(node);
@@ -938,7 +995,7 @@ void try_insert_coalesceable_proj(
     if (usrs.size() != 1 || does_redef_cols(*usrs.begin())) {
       continue;
     }
-    auto only_usr = deconst_mapping[*usrs.begin()];
+    auto only_usr = const_cast<RelAlgNode*>(*usrs.begin());
 
     std::vector<std::unique_ptr<const RexScalar>> exprs;
     std::vector<std::string> fields;
@@ -968,10 +1025,6 @@ void try_insert_coalesceable_proj(
   }
   if (new_nodes.size() > nodes.size()) {
     nodes.swap(new_nodes);
-    deconst_mapping.clear();
-    for (auto node : nodes) {
-      deconst_mapping.insert(std::make_pair(node.get(), node.get()));
-    }
   }
 }
 
@@ -1045,7 +1098,6 @@ void propagate_input_renumbering(
         liveout_renumbering,
     const std::vector<const RelAlgNode*>& ready_nodes,
     const std::unordered_map<const RelAlgNode*, std::unordered_set<size_t>>& old_liveouts,
-    const std::unordered_map<const RelAlgNode*, RelAlgNode*>& deconst_mapping,
     const std::unordered_set<const RelAlgNode*>& intact_nodes,
     const std::unordered_map<const RelAlgNode*, std::unordered_set<const RelAlgNode*>>&
         du_web,
@@ -1057,9 +1109,7 @@ void propagate_input_renumbering(
     auto walker = work_set.front();
     work_set.pop_front();
     CHECK(!dynamic_cast<const RelScan*>(walker));
-    auto node_it = deconst_mapping.find(walker);
-    CHECK(node_it != deconst_mapping.end());
-    auto node = node_it->second;
+    auto node = const_cast<RelAlgNode*>(walker);
     if (auto project = dynamic_cast<RelProject*>(node)) {
       auto old_exprs = project->getExpressionsAndRelease();
       std::vector<std::unique_ptr<const RexScalar>> new_exprs;
@@ -1089,7 +1139,7 @@ void propagate_input_renumbering(
       }
       sort->setCollation(std::move(new_collations));
     } else {
-      CHECK(false);
+      LOG(FATAL) << "Unhandled node type: " << node->toString();
     }
 
     // Ignore empty live_out due to some invalid node
@@ -1143,13 +1193,8 @@ void eliminate_dead_columns(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noe
   if (!has_dead_cols) {
     return;
   }
-  // Patch
-  std::unordered_map<const RelAlgNode*, RelAlgNode*> deconst_mapping;
-  for (auto node : nodes) {
-    deconst_mapping.insert(std::make_pair(node.get(), node.get()));
-  }
   auto web = build_du_web(nodes);
-  try_insert_coalesceable_proj(nodes, old_liveouts, web, deconst_mapping);
+  try_insert_coalesceable_proj(nodes, old_liveouts, web);
 
   for (auto node : nodes) {
     if (intact_nodes.count(node.get()) || does_redef_cols(node.get())) {
@@ -1179,13 +1224,8 @@ void eliminate_dead_columns(std::vector<std::shared_ptr<RelAlgNode>>& nodes) noe
   std::tie(liveout_renumbering, ready_nodes) =
       sweep_dead_columns(old_liveouts, nodes, intact_nodes, web, orig_node_sizes);
   // Propagate
-  propagate_input_renumbering(liveout_renumbering,
-                              ready_nodes,
-                              old_liveouts,
-                              deconst_mapping,
-                              intact_nodes,
-                              web,
-                              orig_node_sizes);
+  propagate_input_renumbering(
+      liveout_renumbering, ready_nodes, old_liveouts, intact_nodes, web, orig_node_sizes);
 }
 
 namespace {
@@ -1231,10 +1271,6 @@ class SubConditionReplacer : public RexDeepCopyVisitor {
 void sink_projected_boolean_expr_to_join(
     std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept {
   auto web = build_du_web(nodes);
-  std::unordered_map<const RelAlgNode*, RelAlgNode*> deconst_mapping;
-  for (auto node : nodes) {
-    deconst_mapping.insert(std::make_pair(node.get(), node.get()));
-  }
   auto liveouts = mark_live_columns(nodes);
   for (auto node : nodes) {
     auto project = std::dynamic_pointer_cast<RelProject>(node);
@@ -1249,7 +1285,7 @@ void sink_projected_boolean_expr_to_join(
     if (usrs.size() != 1) {
       continue;
     }
-    auto join = dynamic_cast<RelJoin*>(deconst_mapping[*usrs.begin()]);
+    auto join = dynamic_cast<RelJoin*>(const_cast<RelAlgNode*>(*usrs.begin()));
     if (!join) {
       continue;
     }
@@ -1542,10 +1578,6 @@ class SubConditionRemover : public RexDeepCopyVisitor {
 
 void hoist_filter_cond_to_cross_join(
     std::vector<std::shared_ptr<RelAlgNode>>& nodes) noexcept {
-  std::unordered_map<const RelAlgNode*, RelAlgNode*> deconst_mapping;
-  for (auto node : nodes) {
-    deconst_mapping.insert(std::make_pair(node.get(), node.get()));
-  }
   std::unordered_set<const RelAlgNode*> visited;
   auto web = build_du_web(nodes);
   for (auto node : nodes) {
@@ -1589,10 +1621,7 @@ void hoist_filter_cond_to_cross_join(
         }
         const auto src_join = dynamic_cast<const RelJoin*>(filter->getInput(0));
         CHECK(src_join);
-        auto filter_it = deconst_mapping.find(filter);
-        CHECK(filter_it != deconst_mapping.end());
-        auto modified_filter = dynamic_cast<RelFilter*>(filter_it->second);
-        CHECK(modified_filter);
+        auto modified_filter = const_cast<RelFilter*>(filter);
 
         if (src_join == join) {
           std::unique_ptr<const RexScalar> filter_condition(

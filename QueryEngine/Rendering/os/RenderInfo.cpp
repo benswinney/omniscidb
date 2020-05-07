@@ -29,7 +29,10 @@ RenderInfo::RenderInfo(
 const Catalog_Namespace::SessionInfo& RenderInfo::getSessionInfo() const {
   CHECK(false);
   static const Catalog_Namespace::SessionInfo tmp(
-      nullptr, Catalog_Namespace::UserMetadata(), ExecutorDeviceType::CPU, "");
+      nullptr,
+      Catalog_Namespace::UserMetadata(-1, "", "", false, -1, false),
+      ExecutorDeviceType::CPU,
+      "");
   return tmp;
 }
 
@@ -108,6 +111,7 @@ const RenderQueryOptions& RenderInfo::getRenderQueryOpts() const {
 }
 
 void RenderInfo::reset(RenderQueryOptions in_query_opts,
-                       const bool disallow_in_situ_only_if_final_ED_is_aggregate_in) {
+                       const bool in_force_non_in_situ_data,
+                       const bool in_disallow_in_situ_only_if_final_ED_is_aggregate) {
   CHECK(false);
 }

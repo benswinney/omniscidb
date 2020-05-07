@@ -24,40 +24,35 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
   OverlapsJoinHashTable(const std::shared_ptr<Analyzer::BinOper> condition,
                         const std::vector<InputTableInfo>& query_infos,
                         const Data_Namespace::MemoryLevel memory_level,
+                        JoinHashTableInterface::HashType hash_layout_type,
                         const size_t entry_count,
-                        ColumnCacheMap& column_map,
+                        ColumnCacheMap& column_cache,
                         Executor* executor,
-                        const std::vector<InnerOuter>& inner_outer_pairs)
+                        const std::vector<InnerOuter>& inner_outer_pairs,
+                        const int device_count)
       : BaselineJoinHashTable(condition,
                               query_infos,
                               memory_level,
-                              JoinHashTableInterface::HashType::OneToOne,
+                              hash_layout_type,
                               entry_count,
-                              column_map,
+                              column_cache,
                               executor,
-                              inner_outer_pairs) {}
+                              inner_outer_pairs,
+                              device_count) {}
 
   ~OverlapsJoinHashTable() override {}
 
+  //! Make hash table from an in-flight SQL query's parse tree etc.
   static std::shared_ptr<OverlapsJoinHashTable> getInstance(
       const std::shared_ptr<Analyzer::BinOper> condition,
       const std::vector<InputTableInfo>& query_infos,
       const Data_Namespace::MemoryLevel memory_level,
       const int device_count,
-      ColumnCacheMap& column_map,
+      ColumnCacheMap& column_cache,
       Executor* executor);
 
-  size_t countBufferOff() const noexcept override {
-    LOG(FATAL) << "Not supported for this layout";
-    return 0;
-  }
-
-  size_t payloadBufferOff() const noexcept override {
-    LOG(FATAL) << "Not supported for this layout";
-    return 0;
-  }
-
   static auto yieldCacheInvalidator() -> std::function<void()> {
+    VLOG(1) << "Invalidate " << auto_tuner_cache_.size() << " cached overlaps hashtable.";
     return []() -> void {
       std::lock_guard<std::mutex> guard(auto_tuner_cache_mutex_);
       auto_tuner_cache_.clear();
@@ -65,13 +60,11 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
   }
 
  protected:
-  void reifyWithLayout(const int device_count,
-                       const JoinHashTableInterface::HashType layout) override;
+  void reifyWithLayout(const JoinHashTableInterface::HashType layout) override;
 
   std::pair<size_t, size_t> calculateCounts(
       size_t shard_count,
       const Fragmenter_Namespace::TableInfo& query_info,
-      const int device_count,
       std::vector<BaselineJoinHashTable::ColumnsForDevice>& columns_per_device);
 
   size_t calculateHashTableSize(size_t number_of_dimensions,
@@ -80,7 +73,8 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
 
   ColumnsForDevice fetchColumnsForDevice(
       const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-      const int device_id) override;
+      const int device_id,
+      ThrustAllocator& dev_buff_owner) override;
 
   std::pair<size_t, size_t> approximateTupleCount(
       const std::vector<ColumnsForDevice>&) const override;
@@ -102,7 +96,8 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
                          const size_t key_component_count,
                          const int device_id) override;
 
-  llvm::Value* codegenKey(const CompilationOptions&) override;
+  HashJoinMatchingSet codegenMatchingSet(const CompilationOptions&,
+                                         const size_t) override;
 
   static std::map<HashTableCacheKey, double> auto_tuner_cache_;
   static std::mutex auto_tuner_cache_mutex_;
@@ -110,7 +105,11 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
  private:
   void computeBucketSizes(std::vector<double>& bucket_sizes_for_dimension,
                           const JoinColumn& join_column,
+                          const JoinColumnTypeInfo& join_column_type,
                           const std::vector<InnerOuter>& inner_outer_pairs);
+
+  llvm::Value* codegenKey(const CompilationOptions&) override;
+  std::vector<llvm::Value*> codegenManyKey(const CompilationOptions&);
 
   std::vector<double> bucket_sizes_for_dimension_;
   double overlaps_hashjoin_bucket_threshold_;

@@ -93,6 +93,8 @@ class ResultSetStorage {
 
   int8_t* getUnderlyingBuffer() const;
 
+  size_t getEntryCount() const { return query_mem_desc_.getEntryCount(); }
+
   template <class KeyType>
   void moveEntriesToBuffer(int8_t* new_buff, const size_t new_entry_count) const;
 
@@ -132,13 +134,6 @@ class ResultSetStorage {
                       int8_t* this_buff,
                       const int8_t* that_buff) const;
 
-  void reduceOneEntryNoCollisionsRowWise(
-      const size_t i,
-      int8_t* this_buff,
-      const int8_t* that_buff,
-      const ResultSetStorage& that,
-      const std::vector<std::string>& serialized_varlen_buffer) const;
-
   bool isEmptyEntry(const size_t entry_idx, const int8_t* buff) const;
   bool isEmptyEntry(const size_t entry_idx) const;
   bool isEmptyEntryColumnar(const size_t entry_idx, const int8_t* buff) const;
@@ -167,6 +162,13 @@ class ResultSetStorage {
                              const size_t target_slot_idx,
                              const size_t init_agg_val_idx,
                              const ResultSetStorage& that) const;
+
+  ALWAYS_INLINE
+  void reduceOneSlotSingleValue(int8_t* this_ptr1,
+                                const TargetInfo& target_info,
+                                const size_t target_slot_idx,
+                                const size_t init_agg_val_idx,
+                                const int8_t* that_ptr1) const;
 
   ALWAYS_INLINE
   void reduceOneSlot(int8_t* this_ptr1,
@@ -199,6 +201,8 @@ class ResultSetStorage {
   void addCountDistinctSetPointerMapping(const int64_t remote_ptr, const int64_t ptr);
 
   int64_t mappedPtr(const int64_t) const;
+
+  size_t binSearchRowCount() const;
 
   const std::vector<TargetInfo> targets_;
   QueryMemoryDescriptor query_mem_desc_;
@@ -294,6 +298,8 @@ class ResultSetRowIterator {
 };
 
 class TSerializedRows;
+
+using AppendedStorage = std::vector<std::unique_ptr<ResultSetStorage>>;
 
 class ResultSet {
  public:
@@ -476,7 +482,7 @@ class ResultSet {
   static std::unique_ptr<ResultSet> unserialize(const TSerializedRows& serialized_rows,
                                                 const Executor*);
 
-  size_t getLimit();
+  size_t getLimit() const;
 
   /**
    * Geo return type options when accessing geo columns from a result set.
@@ -497,23 +503,12 @@ class ResultSet {
                             int8_t* output_buffer,
                             const size_t output_buffer_size) const;
 
-  /*
-   * Determines if it is possible to directly form a ColumnarResults class from this
-   * result set, bypassing the default row-wise columnarization.
-   *
-   * NOTE: If there exists a permutation vector (i.e., ORDER BY), it becomes equivalent to
-   * the row-wise columnarization.
-   */
-  bool isDirectColumnarConversionPossible() const {
-    return query_mem_desc_.didOutputColumnar() && permutation_.empty() &&
-           (query_mem_desc_.getQueryDescriptionType() ==
-                QueryDescriptionType::Projection ||
-            (query_mem_desc_.getQueryDescriptionType() ==
-                 QueryDescriptionType::GroupByPerfectHash &&
-             query_mem_desc_.getGroupbyColCount() == 1));
-  }
+  bool isDirectColumnarConversionPossible() const;
 
   bool didOutputColumnar() const { return this->query_mem_desc_.didOutputColumnar(); }
+
+  bool isZeroCopyColumnarConversionPossible(size_t column_idx) const;
+  const int8_t* getColumnarBuffer(size_t column_idx) const;
 
   QueryDescriptionType getQueryDescriptionType() const {
     return query_mem_desc_.getQueryDescriptionType();
@@ -525,6 +520,8 @@ class ResultSet {
 
   // returns a bitmap of all single-slot targets, as well as its count
   std::tuple<std::vector<bool>, size_t> getSingleSlotTargetBitmap() const;
+
+  std::tuple<std::vector<bool>, size_t> getSupportedSingleSlotTargetBitmap() const;
 
   std::vector<size_t> getSlotIndicesForTargetIndices() const;
 
@@ -538,6 +535,11 @@ class ResultSet {
 
   std::shared_ptr<const std::vector<std::string>> getStringDictionaryPayloadCopy(
       const int dict_id) const;
+
+  template <typename ENTRY_TYPE, QueryDescriptionType QUERY_TYPE, bool COLUMNAR_FORMAT>
+  ENTRY_TYPE getEntryAt(const size_t row_idx,
+                        const size_t target_idx,
+                        const size_t slot_idx) const;
 
  private:
   void advanceCursorToNextEntry(ResultSetRowIterator& iter) const;
@@ -554,9 +556,28 @@ class ResultSet {
                                     const bool fixup_count_distinct_pointers,
                                     const std::vector<bool>& targets_to_skip = {}) const;
 
-  // just for columnar outputs, and direct columnarization use at the moment
+  // NOTE: just for direct columnarization use at the moment
   template <typename ENTRY_TYPE>
-  ENTRY_TYPE getEntryAt(const size_t row_idx, const size_t column_idx) const;
+  ENTRY_TYPE getColumnarPerfectHashEntryAt(const size_t row_idx,
+                                           const size_t target_idx,
+                                           const size_t slot_idx) const;
+
+  template <typename ENTRY_TYPE>
+  ENTRY_TYPE getRowWisePerfectHashEntryAt(const size_t row_idx,
+                                          const size_t target_idx,
+                                          const size_t slot_idx) const;
+
+  template <typename ENTRY_TYPE>
+  ENTRY_TYPE getRowWiseBaselineEntryAt(const size_t row_idx,
+                                       const size_t target_idx,
+                                       const size_t slot_idx) const;
+
+  template <typename ENTRY_TYPE>
+  ENTRY_TYPE getColumnarBaselineEntryAt(const size_t row_idx,
+                                        const size_t target_idx,
+                                        const size_t slot_idx) const;
+
+  size_t binSearchRowCount() const;
 
   size_t parallelRowCount() const;
 
@@ -643,7 +664,10 @@ class ResultSet {
                       const size_t target_logical_idx,
                       const StorageLookupResult& storage_lookup_result) const;
 
-  std::pair<ssize_t, size_t> getStorageIndex(const size_t entry_idx) const;
+  /// Returns (storageIdx, entryIdx) pair, where:
+  /// storageIdx : 0 is storage_, storageIdx-1 is index into appended_storage_.
+  /// entryIdx   : local index into the storage object.
+  std::pair<size_t, size_t> getStorageIndex(const size_t entry_idx) const;
 
   const std::vector<const int8_t*>& getColumnFrag(const size_t storge_idx,
                                                   const size_t col_logical_idx,
@@ -796,7 +820,7 @@ class ResultSet {
   const int device_id_;
   QueryMemoryDescriptor query_mem_desc_;
   mutable std::unique_ptr<ResultSetStorage> storage_;
-  std::vector<std::unique_ptr<ResultSetStorage>> appended_storage_;
+  AppendedStorage appended_storage_;
   mutable size_t crt_row_buff_idx_;
   mutable size_t fetched_so_far_;
   size_t drop_first_;
@@ -917,4 +941,6 @@ GroupValueInfo get_group_value_reduction(int64_t* groups_buffer,
                                          const size_t that_entry_count,
                                          const uint32_t row_size_quad);
 
+std::vector<int64_t> initialize_target_values_for_storage(
+    const std::vector<TargetInfo>& targets);
 #endif  // QUERYENGINE_RESULTSET_H

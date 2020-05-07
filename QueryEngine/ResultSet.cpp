@@ -35,11 +35,43 @@
 #include "Shared/checked_alloc.h"
 #include "Shared/likely.h"
 #include "Shared/thread_count.h"
+#include "Shared/threadpool.h"
 
 #include <algorithm>
 #include <bitset>
 #include <future>
 #include <numeric>
+
+extern bool g_use_tbb_pool;
+
+std::vector<int64_t> initialize_target_values_for_storage(
+    const std::vector<TargetInfo>& targets) {
+  std::vector<int64_t> target_init_vals;
+  for (const auto& target_info : targets) {
+    if (target_info.agg_kind == kCOUNT ||
+        target_info.agg_kind == kAPPROX_COUNT_DISTINCT) {
+      target_init_vals.push_back(0);
+      continue;
+    }
+    if (!target_info.sql_type.get_notnull()) {
+      int64_t init_val =
+          null_val_bit_pattern(target_info.sql_type, takes_float_argument(target_info));
+      target_init_vals.push_back(target_info.is_agg ? init_val : 0);
+    } else {
+      target_init_vals.push_back(target_info.is_agg ? 0xdeadbeef : 0);
+    }
+    if (target_info.agg_kind == kAVG) {
+      target_init_vals.push_back(0);
+    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_geometry()) {
+      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
+        target_init_vals.push_back(0);
+      }
+    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_varlen()) {
+      target_init_vals.push_back(0);
+    }
+  }
+  return target_init_vals;
+}
 
 ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
                                    const QueryMemoryDescriptor& query_mem_desc,
@@ -48,31 +80,8 @@ ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
     : targets_(targets)
     , query_mem_desc_(query_mem_desc)
     , buff_(buff)
-    , buff_is_provided_(buff_is_provided) {
-  for (const auto& target_info : targets_) {
-    if (target_info.agg_kind == kCOUNT ||
-        target_info.agg_kind == kAPPROX_COUNT_DISTINCT) {
-      target_init_vals_.push_back(0);
-      continue;
-    }
-    if (!target_info.sql_type.get_notnull()) {
-      int64_t init_val =
-          null_val_bit_pattern(target_info.sql_type, takes_float_argument(target_info));
-      target_init_vals_.push_back(target_info.is_agg ? init_val : 0);
-    } else {
-      target_init_vals_.push_back(target_info.is_agg ? 0xdeadbeef : 0);
-    }
-    if (target_info.agg_kind == kAVG) {
-      target_init_vals_.push_back(0);
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_geometry()) {
-      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
-        target_init_vals_.push_back(0);
-      }
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_varlen()) {
-      target_init_vals_.push_back(0);
-    }
-  }
-}
+    , buff_is_provided_(buff_is_provided)
+    , target_init_vals_(std::move(initialize_target_values_for_storage(targets))) {}
 
 int8_t* ResultSetStorage::getUnderlyingBuffer() const {
   return buff_;
@@ -194,6 +203,7 @@ ResultSet::ResultSet(int64_t queue_time_ms,
     : device_type_(ExecutorDeviceType::CPU)
     , device_id_(-1)
     , fetched_so_far_(0)
+    , row_set_mem_owner_(row_set_mem_owner)
     , queue_time_ms_(queue_time_ms)
     , render_time_ms_(render_time_ms)
     , estimator_buffer_(nullptr)
@@ -260,6 +270,7 @@ size_t ResultSet::getCurrentRowBufferIndex() const {
   return crt_row_buff_idx_ - 1;
 }
 
+// Note: that.appended_storage_ does not get appended to this.
 void ResultSet::append(ResultSet& that) {
   CHECK_EQ(-1, cached_row_count_);
   if (!that.storage_) {
@@ -312,7 +323,9 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
     return 1;
   }
   if (!permutation_.empty()) {
-    return permutation_.size();
+    const auto limited_row_count = keep_first_ + drop_first_;
+    return limited_row_count ? std::min(limited_row_count, permutation_.size())
+                             : permutation_.size();
   }
   if (cached_row_count_ != -1) {
     CHECK_GE(cached_row_count_, 0);
@@ -320,6 +333,10 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
   }
   if (!storage_) {
     return 0;
+  }
+  if (permutation_.empty() &&
+      query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
+    return binSearchRowCount();
   }
   if (force_parallel || entryCount() > 20000) {
     return parallelRowCount();
@@ -343,36 +360,55 @@ void ResultSet::setCachedRowCount(const size_t row_count) const {
   cached_row_count_ = row_count;
 }
 
+size_t ResultSet::binSearchRowCount() const {
+  if (!storage_) {
+    return 0;
+  }
+
+  size_t row_count = storage_->binSearchRowCount();
+  for (auto& s : appended_storage_) {
+    row_count += s->binSearchRowCount();
+  }
+
+  if (keep_first_ + drop_first_) {
+    const auto limited_row_count = std::min(keep_first_ + drop_first_, row_count);
+    return limited_row_count < drop_first_ ? 0 : limited_row_count - drop_first_;
+  }
+
+  return row_count;
+}
+
 size_t ResultSet::parallelRowCount() const {
-  size_t row_count{0};
-  const size_t worker_count = cpu_threads();
-  std::vector<std::future<size_t>> counter_threads;
-  for (size_t i = 0,
-              start_entry = 0,
-              stride = (entryCount() + worker_count - 1) / worker_count;
-       i < worker_count && start_entry < entryCount();
-       ++i, start_entry += stride) {
-    const auto end_entry = std::min(start_entry + stride, entryCount());
-    counter_threads.push_back(std::async(
-        std::launch::async,
-        [this](const size_t start, const size_t end) {
-          size_t row_count{0};
-          for (size_t i = start; i < end; ++i) {
-            if (!isRowAtEmpty(i)) {
-              ++row_count;
+  auto execute_parallel_row_count = [this](auto counter_threads) -> size_t {
+    const size_t worker_count = cpu_threads();
+    for (size_t i = 0,
+                start_entry = 0,
+                stride = (entryCount() + worker_count - 1) / worker_count;
+         i < worker_count && start_entry < entryCount();
+         ++i, start_entry += stride) {
+      const auto end_entry = std::min(start_entry + stride, entryCount());
+      counter_threads.append(
+          [this](const size_t start, const size_t end) {
+            size_t row_count{0};
+            for (size_t i = start; i < end; ++i) {
+              if (!isRowAtEmpty(i)) {
+                ++row_count;
+              }
             }
-          }
-          return row_count;
-        },
-        start_entry,
-        end_entry));
-  }
-  for (auto& child : counter_threads) {
-    child.wait();
-  }
-  for (auto& child : counter_threads) {
-    row_count += child.get();
-  }
+            return row_count;
+          },
+          start_entry,
+          end_entry);
+    }
+    const auto row_counts = counter_threads.join();
+    const size_t row_count = std::accumulate(row_counts.begin(), row_counts.end(), 0);
+    return row_count;
+  };
+  // will fall back to futures threadpool if TBB is not enabled
+  const auto row_count =
+      g_use_tbb_pool
+          ? execute_parallel_row_count(threadpool::ThreadPool<size_t>())
+          : execute_parallel_row_count(threadpool::FuturesThreadPool<size_t>());
   if (keep_first_ + drop_first_) {
     const auto limited_row_count = std::min(keep_first_ + drop_first_, row_count);
     return limited_row_count < drop_first_ ? 0 : limited_row_count - drop_first_;
@@ -453,7 +489,7 @@ QueryMemoryDescriptor ResultSet::fixupQueryMemoryDescriptor(
     const QueryMemoryDescriptor& query_mem_desc) {
   auto query_mem_desc_copy = query_mem_desc;
   query_mem_desc_copy.resetGroupColWidths(
-      std::vector<int8_t>(query_mem_desc_copy.groupColWidthsSize(), 8));
+      std::vector<int8_t>(query_mem_desc_copy.getGroupbyColCount(), 8));
   if (query_mem_desc.didOutputColumnar()) {
     return query_mem_desc_copy;
   }
@@ -463,6 +499,7 @@ QueryMemoryDescriptor ResultSet::fixupQueryMemoryDescriptor(
 
 void ResultSet::sort(const std::list<Analyzer::OrderEntry>& order_entries,
                      const size_t top_n) {
+  auto timer = DEBUG_TIMER(__func__);
   CHECK_EQ(-1, cached_row_count_);
   CHECK(!targets_.empty());
 #ifdef HAVE_CUDA
@@ -591,7 +628,7 @@ void ResultSet::parallelTop(const std::list<Analyzer::OrderEntry>& order_entries
   topPermutation(permutation_, top_n, compare);
 }
 
-std::pair<ssize_t, size_t> ResultSet::getStorageIndex(const size_t entry_idx) const {
+std::pair<size_t, size_t> ResultSet::getStorageIndex(const size_t entry_idx) const {
   size_t fixedup_entry_idx = entry_idx;
   auto entry_count = storage_->query_mem_desc_.getEntryCount();
   const bool is_rowwise_layout = !storage_->query_mem_desc_.didOutputColumnar();
@@ -608,18 +645,16 @@ std::pair<ssize_t, size_t> ResultSet::getStorageIndex(const size_t entry_idx) co
     }
     fixedup_entry_idx -= entry_count;
   }
-  CHECK(false);
-  return {-1, entry_idx};
+  UNREACHABLE() << "entry_idx = " << entry_idx << ", query_mem_desc_.getEntryCount() = "
+                << query_mem_desc_.getEntryCount();
+  return {};
 }
 
 ResultSet::StorageLookupResult ResultSet::findStorage(const size_t entry_idx) const {
-  ssize_t stg_idx{-1};
-  size_t fixedup_entry_idx{entry_idx};
-  std::tie(stg_idx, fixedup_entry_idx) = getStorageIndex(entry_idx);
-  CHECK_LE(ssize_t(0), stg_idx);
+  auto [stg_idx, fixedup_entry_idx] = getStorageIndex(entry_idx);
   return {stg_idx ? appended_storage_[stg_idx - 1].get() : storage_.get(),
           fixedup_entry_idx,
-          static_cast<size_t>(stg_idx)};
+          stg_idx};
 }
 
 template <typename BUFFER_ITERATOR_TYPE>
@@ -634,7 +669,7 @@ bool ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::operator()(
   const auto rhs_storage = rhs_storage_lookup_result.storage_ptr;
   const auto fixedup_lhs = lhs_storage_lookup_result.fixedup_entry_idx;
   const auto fixedup_rhs = rhs_storage_lookup_result.fixedup_entry_idx;
-  for (const auto order_entry : order_entries_) {
+  for (const auto& order_entry : order_entries_) {
     CHECK_GE(order_entry.tle_no, 1);
     const auto& agg_info = result_set_->targets_[order_entry.tle_no - 1];
     const auto entry_ti = get_compact_type(agg_info);
@@ -854,7 +889,7 @@ int64_t ResultSetStorage::mappedPtr(const int64_t remote_ptr) const {
   return it->second;
 }
 
-size_t ResultSet::getLimit() {
+size_t ResultSet::getLimit() const {
   return keep_first_;
 }
 
@@ -874,6 +909,43 @@ bool use_parallel_algorithms(const ResultSet& rows) {
   return can_use_parallel_algorithms(rows) && rows.entryCount() >= 20000;
 }
 
+/**
+ * Determines if it is possible to directly form a ColumnarResults class from this
+ * result set, bypassing the default columnarization.
+ *
+ * NOTE: If there exists a permutation vector (i.e., in some ORDER BY queries), it
+ * becomes equivalent to the row-wise columnarization.
+ */
+bool ResultSet::isDirectColumnarConversionPossible() const {
+  if (!g_enable_direct_columnarization) {
+    return false;
+  } else if (query_mem_desc_.didOutputColumnar()) {
+    return permutation_.empty() && (query_mem_desc_.getQueryDescriptionType() ==
+                                        QueryDescriptionType::Projection ||
+                                    (query_mem_desc_.getQueryDescriptionType() ==
+                                         QueryDescriptionType::GroupByPerfectHash ||
+                                     query_mem_desc_.getQueryDescriptionType() ==
+                                         QueryDescriptionType::GroupByBaselineHash));
+  } else {
+    return permutation_.empty() && (query_mem_desc_.getQueryDescriptionType() ==
+                                        QueryDescriptionType::GroupByPerfectHash ||
+                                    query_mem_desc_.getQueryDescriptionType() ==
+                                        QueryDescriptionType::GroupByBaselineHash);
+  }
+}
+
+bool ResultSet::isZeroCopyColumnarConversionPossible(size_t column_idx) const {
+  return query_mem_desc_.didOutputColumnar() &&
+         query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection &&
+         appended_storage_.empty() && storage_ &&
+         (lazy_fetch_info_.empty() || !lazy_fetch_info_[column_idx].is_lazily_fetched);
+}
+
+const int8_t* ResultSet::getColumnarBuffer(size_t column_idx) const {
+  CHECK(isZeroCopyColumnarConversionPossible(column_idx));
+  return storage_->getUnderlyingBuffer() + query_mem_desc_.getColOffInBytes(column_idx);
+}
+
 // returns a bitmap (and total number) of all single slot targets
 std::tuple<std::vector<bool>, size_t> ResultSet::getSingleSlotTargetBitmap() const {
   std::vector<bool> target_bitmap(targets_.size(), true);
@@ -889,6 +961,32 @@ std::tuple<std::vector<bool>, size_t> ResultSet::getSingleSlotTargetBitmap() con
     }
   }
   return std::make_tuple(std::move(target_bitmap), num_single_slot_targets);
+}
+
+/**
+ * This function returns a bitmap and population count of it, where it denotes
+ * all supported single-column targets suitable for direct columnarization.
+ *
+ * The final goal is to remove the need for such selection, but at the moment for any
+ * target that doesn't qualify for direct columnarization, we use the traditional
+ * result set's iteration to handle it (e.g., count distinct, approximate count distinct)
+ */
+std::tuple<std::vector<bool>, size_t> ResultSet::getSupportedSingleSlotTargetBitmap()
+    const {
+  CHECK(isDirectColumnarConversionPossible());
+  auto [single_slot_targets, num_single_slot_targets] = getSingleSlotTargetBitmap();
+
+  for (size_t target_idx = 0; target_idx < single_slot_targets.size(); target_idx++) {
+    const auto& target = targets_[target_idx];
+    if (single_slot_targets[target_idx] &&
+        (is_distinct_target(target) ||
+         (target.is_agg && target.agg_kind == kSAMPLE && target.sql_type == kFLOAT))) {
+      single_slot_targets[target_idx] = false;
+      num_single_slot_targets--;
+    }
+  }
+  CHECK_GE(num_single_slot_targets, size_t(0));
+  return std::make_tuple(std::move(single_slot_targets), num_single_slot_targets);
 }
 
 // returns the starting slot index for all targets in the result set

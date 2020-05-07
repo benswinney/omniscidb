@@ -44,7 +44,8 @@ enum DBObjectType {
   DatabaseDBObjectType,
   TableDBObjectType,
   DashboardDBObjectType,
-  ViewDBObjectType
+  ViewDBObjectType,
+  ServerDBObjectType
 };
 
 std::string DBObjectTypeToString(DBObjectType type);
@@ -122,6 +123,12 @@ struct ViewPrivileges {
       CREATE_VIEW | DROP_VIEW | SELECT_FROM_VIEW | INSERT_INTO_VIEW;
 };
 
+struct ServerPrivileges {
+  static const int32_t ALL = -1;
+  static const int32_t CREATE_SERVER = 1 << 0;
+  static const int32_t DROP_SERVER = 1 << 1;
+};
+
 struct AccessPrivileges {
   int64_t privileges;
 
@@ -175,6 +182,11 @@ struct AccessPrivileges {
   static const AccessPrivileges UPDATE_IN_VIEW;
   static const AccessPrivileges DELETE_FROM_VIEW;
   static const AccessPrivileges TRUNCATE_VIEW;
+
+  // server permissions
+  static const AccessPrivileges ALL_SERVER;
+  static const AccessPrivileges CREATE_SERVER;
+  static const AccessPrivileges DROP_SERVER;
 };
 
 class DBObject {
@@ -193,6 +205,7 @@ class DBObject {
   void setObjectType(const DBObjectType& objectType);
   void setName(std::string name) { objectName_ = name; }
   std::string getName() const { return objectName_; }
+  DBObjectType getType() const { return objectType_; }
   DBObjectKey getObjectKey() const {
     CHECK(-1 != objectKey_.dbId); /** load key not called? */
     return objectKey_;

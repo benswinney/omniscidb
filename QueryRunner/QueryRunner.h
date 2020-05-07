@@ -17,29 +17,27 @@
 #ifndef QUERY_RUNNER_H
 #define QUERY_RUNNER_H
 
-#include "../QueryEngine/CompilationOptions.h"
-#include "LeafAggregator.h"
-#include "ThriftHandler/QueryState.h"
-
-#include <Catalog/SysCatalog.h>
-#include <Catalog/TableDescriptor.h>
-
 #include <fstream>
 #include <memory>
 #include <string>
 
+#include "Catalog/SessionInfo.h"
+#include "Catalog/SysCatalog.h"
+#include "Catalog/TableDescriptor.h"
+#include "LeafAggregator.h"
+#include "QueryEngine/BaselineJoinHashTable.h"
+#include "QueryEngine/CompilationOptions.h"
+#include "QueryEngine/JoinHashTable.h"
+#include "QueryEngine/OverlapsJoinHashTable.h"
+#include "ThriftHandler/QueryState.h"
+
 namespace Catalog_Namespace {
-class SessionInfo;
 class Catalog;
 struct UserMetadata;
 }  // namespace Catalog_Namespace
 
 class ResultSet;
 class ExecutionResult;
-
-namespace Planner {
-class RootPlan;
-}
 
 namespace Parser {
 class CopyTableStmt;
@@ -54,19 +52,6 @@ class Loader;
 class Calcite;
 
 namespace QueryRunner {
-
-struct IRFileWriter {
-  IRFileWriter(const std::string& filename) : filename(filename) {
-    ofs.open(filename, std::ios::trunc);
-  }
-  ~IRFileWriter() { ofs.close(); }
-  std::string filename;
-  std::ofstream ofs;
-
-  void operator()(const std::string& query_str, const std::string& ir_str) {
-    ofs << query_str << "\n\n" << ir_str << "\n\n";
-  }
-};
 
 class QueryRunner {
  public:
@@ -122,13 +107,14 @@ class QueryRunner {
     return qr_instance_.get();
   }
 
-  static void reset() { qr_instance_.reset(nullptr); }
+  static void reset();
 
   std::shared_ptr<Catalog_Namespace::SessionInfo> getSession() const {
     return session_info_;
   }
   std::shared_ptr<Catalog_Namespace::Catalog> getCatalog() const;
   std::shared_ptr<Calcite> getCalcite() const;
+  std::shared_ptr<Executor> getExecutor() const;
 
   bool gpusPresent() const;
   virtual void clearGpuMemory() const;
@@ -144,6 +130,12 @@ class QueryRunner {
                                          const bool hoist_literals,
                                          const bool allow_loop_joins,
                                          const bool just_explain = false);
+  virtual std::shared_ptr<ResultSet> runSQLWithAllowingInterrupt(
+      const std::string& query_str,
+      std::shared_ptr<Executor> executor,
+      const std::string& session_id,
+      const ExecutorDeviceType device_type,
+      const unsigned interrupt_check_freq = 1000);
   virtual std::vector<std::shared_ptr<ResultSet>> runMultipleStatements(
       const std::string&,
       const ExecutorDeviceType);
@@ -151,9 +143,11 @@ class QueryRunner {
   virtual void runImport(Parser::CopyTableStmt* import_stmt);
   virtual std::unique_ptr<Importer_NS::Loader> getLoader(const TableDescriptor* td) const;
 
-  virtual void setIRFilename(const std::string& filename) {
-    ir_file_writer_ = std::make_unique<IRFileWriter>(filename);
-  }
+  const std::shared_ptr<std::vector<int32_t>>& getCachedJoinHashTable(size_t idx);
+  const std::shared_ptr<std::vector<int8_t>>& getCachedBaselineHashTable(size_t idx);
+  size_t getEntryCntCachedBaselineHashTable(size_t idx);
+  uint64_t getNumberOfCachedJoinHashTables();
+  uint64_t getNumberOfCachedBaselineJoinHashTables();
 
   virtual ~QueryRunner() {}
 
@@ -180,16 +174,22 @@ class QueryRunner {
               const bool create_user,
               const bool create_db);
 
-  Planner::RootPlan* parsePlanLegacy(const std::string& query_str);
-  Planner::RootPlan* parsePlanCalcite(QueryStateProxy);
-  Planner::RootPlan* parsePlan(QueryStateProxy);
-
   static std::unique_ptr<QueryRunner> qr_instance_;
 
   std::shared_ptr<Catalog_Namespace::SessionInfo> session_info_;
+};
 
- private:
-  std::unique_ptr<IRFileWriter> ir_file_writer_;
+class ImportDriver : public QueryRunner {
+ public:
+  ImportDriver(std::shared_ptr<Catalog_Namespace::Catalog> cat,
+               const Catalog_Namespace::UserMetadata& user,
+               const ExecutorDeviceType dt = ExecutorDeviceType::GPU);
+
+  void importGeoTable(const std::string& file_path,
+                      const std::string& table_name,
+                      const bool compression,
+                      const bool create_table,
+                      const bool explode_collections);
 };
 
 }  // namespace QueryRunner

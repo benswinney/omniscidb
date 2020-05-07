@@ -74,6 +74,7 @@ class Expr : public std::enable_shared_from_this<Expr> {
   Expr(const SQLTypeInfo& ti, bool has_agg = false)
       : type_info(ti), contains_agg(has_agg) {}
   virtual ~Expr() {}
+  std::shared_ptr<Analyzer::Expr> get_shared_ptr() { return shared_from_this(); }
   const SQLTypeInfo& get_type_info() const { return type_info; }
   void set_type_info(const SQLTypeInfo& ti) { type_info = ti; }
   bool get_contains_agg() const { return contains_agg; }
@@ -227,7 +228,7 @@ class ColumnVar : public Expr {
  protected:
   int table_id;   // the global table id
   int column_id;  // the column id
-  int rte_idx;    // 0-based range table index. only used by the analyzer and planner.
+  int rte_idx;    // 0-based range table index, used for table ordering in multi-joins
 };
 
 /*
@@ -724,6 +725,62 @@ class KeyForStringExpr : public Expr {
   }
   bool operator==(const Expr& rhs) const override;
   std::string toString() const override;
+  void find_expr(bool (*f)(const Expr*),
+                 std::list<const Expr*>& expr_list) const override;
+
+ private:
+  std::shared_ptr<Analyzer::Expr> arg;
+};
+
+/**
+ * @brief Expression class for the LOWER (lowercase) string function.
+ * The "arg" constructor parameter must be an expression that resolves to a string
+ * datatype (e.g. TEXT).
+ */
+class LowerExpr : public Expr {
+ public:
+  LowerExpr(std::shared_ptr<Analyzer::Expr> arg) : Expr(arg->get_type_info()), arg(arg) {}
+
+  const Expr* get_arg() const { return arg.get(); }
+
+  const std::shared_ptr<Analyzer::Expr> get_own_arg() const { return arg; }
+
+  void collect_rte_idx(std::set<int>& rte_idx_set) const override {
+    arg->collect_rte_idx(rte_idx_set);
+  }
+
+  void collect_column_var(
+      std::set<const ColumnVar*, bool (*)(const ColumnVar*, const ColumnVar*)>&
+          colvar_set,
+      bool include_agg) const override {
+    arg->collect_column_var(colvar_set, include_agg);
+  }
+
+  std::shared_ptr<Analyzer::Expr> rewrite_with_targetlist(
+      const std::vector<std::shared_ptr<TargetEntry>>& tlist) const override {
+    return makeExpr<LowerExpr>(arg->rewrite_with_targetlist(tlist));
+  }
+
+  std::shared_ptr<Analyzer::Expr> rewrite_with_child_targetlist(
+      const std::vector<std::shared_ptr<TargetEntry>>& tlist) const override {
+    return makeExpr<LowerExpr>(arg->rewrite_with_child_targetlist(tlist));
+  }
+
+  std::shared_ptr<Analyzer::Expr> rewrite_agg_to_var(
+      const std::vector<std::shared_ptr<TargetEntry>>& tlist) const override {
+    return makeExpr<LowerExpr>(arg->rewrite_agg_to_var(tlist));
+  }
+
+  std::shared_ptr<Analyzer::Expr> deep_copy() const override;
+
+  void group_predicates(std::list<const Expr*>& scan_predicates,
+                        std::list<const Expr*>& join_predicates,
+                        std::list<const Expr*>& const_predicates) const override;
+
+  bool operator==(const Expr& rhs) const override;
+
+  std::string toString() const override;
+
   void find_expr(bool (*f)(const Expr*),
                  std::list<const Expr*>& expr_list) const override;
 
@@ -1368,11 +1425,13 @@ class ArrayExpr : public Expr {
   ArrayExpr(SQLTypeInfo const& array_ti,
             ExpressionPtrVector const& array_exprs,
             int expr_index,
+            bool is_null = false,
             bool local_alloc = false)
-      : Expr(preInitTweakedTypeInfo(array_ti))
+      : Expr(array_ti)
       , contained_expressions_(array_exprs)
       , expr_index_(expr_index)
-      , local_alloc_(local_alloc) {}
+      , local_alloc_(local_alloc)
+      , is_null_(is_null) {}
 
   Analyzer::ExpressionPtr deep_copy() const override;
   std::string toString() const override;
@@ -1380,6 +1439,7 @@ class ArrayExpr : public Expr {
   size_t getElementCount() const { return contained_expressions_.size(); }
   int32_t getExprIndex() const { return expr_index_; }
   bool isLocalAlloc() const { return local_alloc_; }
+  bool isNull() const { return is_null_; }
 
   const Analyzer::Expr* getElement(const size_t i) const {
     CHECK_LT(i, contained_expressions_.size());
@@ -1387,16 +1447,30 @@ class ArrayExpr : public Expr {
   }
 
  private:
-  SQLTypeInfo& preInitTweakedTypeInfo(SQLTypeInfo const& array_ti) {
-    tweaked_type_info_ = array_ti;
-    tweaked_type_info_.setStandardBufferPackaging();
-    return tweaked_type_info_;
-  }
-
-  SQLTypeInfo tweaked_type_info_;
   ExpressionPtrVector contained_expressions_;
   int expr_index_;
   bool local_alloc_;
+  bool is_null_;  // constant is NULL
+};
+
+/*
+ * @type GeoExpr
+ * @brief Geospatial expression
+ */
+class GeoExpr : public Expr {
+ public:
+  GeoExpr(const SQLTypeInfo& ti, const std::vector<std::shared_ptr<Analyzer::Expr>>& args)
+      : Expr(ti), args_(args){};
+
+  std::shared_ptr<Analyzer::Expr> deep_copy() const override;
+
+  bool operator==(const Expr& rhs) const override;
+  std::string toString() const override;
+
+  const std::vector<std::shared_ptr<Analyzer::Expr>>& getArgs() const { return args_; }
+
+ private:
+  const std::vector<std::shared_ptr<Analyzer::Expr>> args_;
 };
 
 /*

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,16 +38,21 @@
 #include "RuntimeFunctions.h"
 #include "SpeculativeTopN.h"
 
+#include "TableFunctions/TableFunctionCompilationContext.h"
+#include "TableFunctions/TableFunctionExecutionContext.h"
+
 #include "CudaMgr/CudaMgr.h"
 #include "DataMgr/BufferMgr/BufferMgr.h"
 #include "Parser/ParserNode.h"
-#include "Shared/ExperimentalTypeUtilities.h"
-#include "Shared/MapDParameters.h"
+#include "Shared/SystemParameters.h"
 #include "Shared/TypedDataAccessors.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/measure.h"
+#include "Shared/misc.h"
 #include "Shared/scope.h"
 #include "Shared/shard_key.h"
+#include "Shared/sql_type_to_string.h"
+#include "Shared/threadpool.h"
 
 #include "AggregatedColRange.h"
 #include "StringDictionaryGenerations.h"
@@ -65,9 +70,9 @@
 #include <set>
 #include <thread>
 
-bool g_enable_debug_timer{false};
 bool g_enable_watchdog{false};
 bool g_enable_dynamic_watchdog{false};
+bool g_use_tbb_pool{false};
 unsigned g_dynamic_watchdog_time_limit{10000};
 bool g_allow_cpu_retry{true};
 bool g_null_div_by_zero{false};
@@ -83,33 +88,45 @@ float g_filter_push_down_high_frac{-1.0f};
 size_t g_filter_push_down_passing_row_ubound{0};
 bool g_enable_columnar_output{false};
 bool g_enable_overlaps_hashjoin{false};
+bool g_enable_hashjoin_many_to_many{false};
 bool g_cache_string_hash{false};
 size_t g_overlaps_max_table_size_bytes{1024 * 1024 * 1024};
 bool g_strip_join_covered_quals{false};
 size_t g_constrained_by_in_threshold{10};
 size_t g_big_group_threshold{20000};
 bool g_enable_window_functions{true};
+bool g_enable_table_functions{false};
 size_t g_max_memory_allocation_size{2000000000};  // set to max slab size
 size_t g_min_memory_allocation_size{
     256};  // minimum memory allocation required for projection query output buffer
            // without pre-flight count
 bool g_enable_bump_allocator{false};
 double g_bump_allocator_step_reduction{0.75};
+bool g_enable_direct_columnarization{true};
+extern bool g_enable_experimental_string_functions;
+bool g_enable_runtime_query_interrupt{false};
+unsigned g_runtime_query_interrupt_frequency{1000};
+size_t g_gpu_smem_threshold{
+    4096};  // GPU shared memory threshold (in bytes), if larger buffer sizes are required
+            // we do not use GPU shared memory optimizations
+bool g_enable_smem_non_grouped_agg{
+    true};  // enable optimizations for using GPU shared memory in implementation of
+            // non-grouped aggregates
 
 int const Executor::max_gpu_count;
+
+const int32_t Executor::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES;
 
 Executor::Executor(const int db_id,
                    const size_t block_size_x,
                    const size_t grid_size_x,
                    const std::string& debug_dir,
-                   const std::string& debug_file,
-                   ::QueryRenderer::QueryRenderManager* render_manager)
+                   const std::string& debug_file)
     : cgen_state_(new CgenState({}, false))
     , gpu_active_modules_device_mask_(0x0)
     , interrupted_(false)
     , cpu_code_cache_(code_cache_size)
     , gpu_code_cache_(code_cache_size)
-    , render_manager_(render_manager)
     , block_size_x_(block_size_x)
     , grid_size_x_(grid_size_x)
     , debug_dir_(debug_dir)
@@ -123,10 +140,9 @@ std::shared_ptr<Executor> Executor::getExecutor(
     const int db_id,
     const std::string& debug_dir,
     const std::string& debug_file,
-    const MapDParameters mapd_parameters,
-    ::QueryRenderer::QueryRenderManager* render_manager) {
+    const SystemParameters system_parameters) {
   INJECT_TIMER(getExecutor);
-  const auto executor_key = std::make_pair(db_id, render_manager);
+  const auto executor_key = db_id;
   {
     mapd_shared_lock<mapd_shared_mutex> read_lock(executors_cache_mutex_);
     auto it = executors_.find(executor_key);
@@ -141,11 +157,10 @@ std::shared_ptr<Executor> Executor::getExecutor(
       return it->second;
     }
     auto executor = std::make_shared<Executor>(db_id,
-                                               mapd_parameters.cuda_block_size,
-                                               mapd_parameters.cuda_grid_size,
+                                               system_parameters.cuda_block_size,
+                                               system_parameters.cuda_grid_size,
                                                debug_dir,
-                                               debug_file,
-                                               render_manager);
+                                               debug_file);
     auto it_ok = executors_.insert(std::make_pair(executor_key, executor));
     CHECK(it_ok.second);
     return executor;
@@ -227,6 +242,10 @@ const ColumnDescriptor* Executor::getPhysicalColumnDescriptor(
 
 const Catalog_Namespace::Catalog* Executor::getCatalog() const {
   return catalog_;
+}
+
+void Executor::setCatalog(const Catalog_Namespace::Catalog* catalog) {
+  catalog_ = catalog;
 }
 
 const std::shared_ptr<RowSetMemoryOwner> Executor::getRowSetMemoryOwner() const {
@@ -470,8 +489,12 @@ std::vector<int8_t> Executor::serializeLiterals(
       case 6: {
         const auto p = boost::get<std::pair<std::string, int>>(&lit);
         CHECK(p);
-        const auto str_id = getStringDictionaryProxy(p->second, row_set_mem_owner_, true)
-                                ->getIdOfString(p->first);
+        const auto str_id =
+            g_enable_experimental_string_functions
+                ? getStringDictionaryProxy(p->second, row_set_mem_owner_, true)
+                      ->getOrAddTransient(p->first)
+                : getStringDictionaryProxy(p->second, row_set_mem_owner_, true)
+                      ->getIdOfString(p->first);
         memcpy(&serialized[off - lit_bytes], &str_id, lit_bytes);
         break;
       }
@@ -763,6 +786,19 @@ std::pair<int64_t, int32_t> Executor::reduceResults(const SQLAgg agg,
             CHECK(false);
         }
       }
+    case kSINGLE_VALUE: {
+      int64_t agg_result = agg_init_val;
+      for (size_t i = 0; i < out_vec_sz; ++i) {
+        if (out_vec[i] != agg_init_val) {
+          if (agg_result == agg_init_val) {
+            agg_result = out_vec[i];
+          } else if (out_vec[i] != agg_result) {
+            return {agg_result, Executor::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES};
+          }
+        }
+      }
+      return {agg_result, 0};
+    }
     case kSAMPLE: {
       int64_t agg_result = agg_init_val;
       for (size_t i = 0; i < out_vec_sz; ++i) {
@@ -803,8 +839,11 @@ ResultSetPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
     for (const auto target_expr : ra_exe_unit.target_exprs) {
       targets.push_back(get_target_info(target_expr, g_bigint_count));
     }
-    return std::make_shared<ResultSet>(
-        targets, ExecutorDeviceType::CPU, QueryMemoryDescriptor(), nullptr, nullptr);
+    return std::make_shared<ResultSet>(targets,
+                                       ExecutorDeviceType::CPU,
+                                       QueryMemoryDescriptor(),
+                                       row_set_mem_owner_,
+                                       this);
   }
   using IndexedResultSet = std::pair<ResultSetPtr, std::vector<size_t>>;
   std::sort(results_per_device.begin(),
@@ -823,6 +862,7 @@ ResultSetPtr Executor::reduceMultiDeviceResults(
     std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
+  auto timer = DEBUG_TIMER(__func__);
   if (ra_exe_unit.estimator) {
     return reduce_estimator_results(ra_exe_unit, results_per_device);
   }
@@ -846,6 +886,7 @@ ResultSetPtr Executor::reduceMultiDeviceResultSets(
     std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
+  auto timer = DEBUG_TIMER(__func__);
   std::shared_ptr<ResultSet> reduced_results;
 
   const auto& first = results_per_device.front().first;
@@ -887,15 +928,11 @@ ResultSetPtr Executor::reduceMultiDeviceResultSets(
     reduced_results = first;
   }
 
-#ifdef WITH_REDUCTION_JIT
   const auto& this_result_set = results_per_device[0].first;
   ResultSetReductionJIT reduction_jit(this_result_set->getQueryMemDesc(),
                                       this_result_set->getTargetInfos(),
                                       this_result_set->getTargetInitVals());
   const auto reduction_code = reduction_jit.codegen();
-#else
-  ReductionCode reduction_code{};
-#endif  // WITH_REDUCTION_JIT
   for (size_t i = 1; i < results_per_device.size(); ++i) {
     reduced_results->getStorage()->reduce(
         *(results_per_device[i].first->getStorage()), {}, reduction_code);
@@ -1075,6 +1112,107 @@ bool is_trivial_loop_join(const std::vector<InputTableInfo>& query_infos,
 
 namespace {
 
+template <typename T>
+std::vector<std::string> expr_container_to_string(const T& expr_container) {
+  std::vector<std::string> expr_strs;
+  for (const auto& expr : expr_container) {
+    if (!expr) {
+      expr_strs.emplace_back("NULL");
+    } else {
+      expr_strs.emplace_back(expr->toString());
+    }
+  }
+  return expr_strs;
+}
+
+template <>
+std::vector<std::string> expr_container_to_string(
+    const std::list<Analyzer::OrderEntry>& expr_container) {
+  std::vector<std::string> expr_strs;
+  for (const auto& expr : expr_container) {
+    expr_strs.emplace_back(expr.toString());
+  }
+  return expr_strs;
+}
+
+std::string join_type_to_string(const JoinType type) {
+  switch (type) {
+    case JoinType::INNER:
+      return "INNER";
+    case JoinType::LEFT:
+      return "LEFT";
+    case JoinType::INVALID:
+      return "INVALID";
+  }
+  UNREACHABLE();
+  return "";
+}
+
+std::string sort_algorithm_to_string(const SortAlgorithm algorithm) {
+  switch (algorithm) {
+    case SortAlgorithm::Default:
+      return "ResultSet";
+    case SortAlgorithm::SpeculativeTopN:
+      return "Speculative Top N";
+    case SortAlgorithm::StreamingTopN:
+      return "Streaming Top N";
+  }
+  UNREACHABLE();
+  return "";
+}
+
+}  // namespace
+
+std::ostream& operator<<(std::ostream& os, const RelAlgExecutionUnit& ra_exe_unit) {
+  os << "\n\tTable/Col/Levels: ";
+  for (const auto& input_col_desc : ra_exe_unit.input_col_descs) {
+    const auto& scan_desc = input_col_desc->getScanDesc();
+    os << "(" << scan_desc.getTableId() << ", " << input_col_desc->getColId() << ", "
+       << scan_desc.getNestLevel() << ") ";
+  }
+  if (!ra_exe_unit.simple_quals.empty()) {
+    os << "\n\tSimple Quals: "
+       << boost::algorithm::join(expr_container_to_string(ra_exe_unit.simple_quals),
+                                 ", ");
+  }
+  if (!ra_exe_unit.quals.empty()) {
+    os << "\n\tQuals: "
+       << boost::algorithm::join(expr_container_to_string(ra_exe_unit.quals), ", ");
+  }
+  if (!ra_exe_unit.join_quals.empty()) {
+    os << "\n\tJoin Quals: ";
+    for (size_t i = 0; i < ra_exe_unit.join_quals.size(); i++) {
+      const auto& join_condition = ra_exe_unit.join_quals[i];
+      os << "\t\t" << std::to_string(i) << " "
+         << join_type_to_string(join_condition.type);
+      os << boost::algorithm::join(expr_container_to_string(join_condition.quals), ", ");
+    }
+  }
+  if (!ra_exe_unit.groupby_exprs.empty()) {
+    os << "\n\tGroup By: "
+       << boost::algorithm::join(expr_container_to_string(ra_exe_unit.groupby_exprs),
+                                 ", ");
+  }
+  os << "\n\tProjected targets: "
+     << boost::algorithm::join(expr_container_to_string(ra_exe_unit.target_exprs), ", ");
+  os << "\n\tHas Estimator: " << bool_to_string(ra_exe_unit.estimator == nullptr);
+  os << "\n\tSort Info: ";
+  const auto& sort_info = ra_exe_unit.sort_info;
+  os << "\n\t  Order Entries: "
+     << boost::algorithm::join(expr_container_to_string(sort_info.order_entries), ", ");
+  os << "\n\t  Algorithm: " << sort_algorithm_to_string(sort_info.algorithm);
+  os << "\n\t  Limit: " << std::to_string(sort_info.limit);
+  os << "\n\t  Offset: " << std::to_string(sort_info.offset);
+  os << "\n\tScan Limit: " << std::to_string(ra_exe_unit.scan_limit);
+  os << "\n\tBump Allocator: " << bool_to_string(ra_exe_unit.use_bump_allocator);
+  if (ra_exe_unit.union_all) {
+    os << "\n\tUnion: " << std::string(*ra_exe_unit.union_all ? "UNION ALL" : "UNION");
+  }
+  return os;
+}
+
+namespace {
+
 RelAlgExecutionUnit replace_scan_limit(const RelAlgExecutionUnit& ra_exe_unit_in,
                                        const size_t new_scan_limit) {
   return {ra_exe_unit_in.input_descs,
@@ -1088,7 +1226,9 @@ RelAlgExecutionUnit replace_scan_limit(const RelAlgExecutionUnit& ra_exe_unit_in
           ra_exe_unit_in.sort_info,
           new_scan_limit,
           ra_exe_unit_in.query_features,
-          ra_exe_unit_in.use_bump_allocator};
+          ra_exe_unit_in.use_bump_allocator,
+          ra_exe_unit_in.union_all,
+          ra_exe_unit_in.query_state};
 }
 
 }  // namespace
@@ -1105,6 +1245,8 @@ ResultSetPtr Executor::executeWorkUnit(
     RenderInfo* render_info,
     const bool has_cardinality_estimation,
     ColumnCacheMap& column_cache) {
+  VLOG(1) << "Executing work unit:" << ra_exe_unit_in;
+
   try {
     return executeWorkUnitImpl(max_groups_buffer_entry_guess,
                                is_agg,
@@ -1148,8 +1290,8 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     const bool has_cardinality_estimation,
     ColumnCacheMap& column_cache) {
   INJECT_TIMER(Exec_executeWorkUnit);
-  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in);
-  const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type_);
+  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in, co);
+  const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type);
   CHECK(!query_infos.empty());
   if (!max_groups_buffer_entry_guess) {
     // The query has failed the first execution attempt because of running out
@@ -1166,25 +1308,37 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     ColumnFetcher column_fetcher(this, column_cache);
     std::unique_ptr<QueryCompilationDescriptor> query_comp_desc_owned;
     std::unique_ptr<QueryMemoryDescriptor> query_mem_desc_owned;
-    try {
-      INJECT_TIMER(execution_dispatch_comp);
-      std::tie(query_comp_desc_owned, query_mem_desc_owned) =
-          execution_dispatch.compile(max_groups_buffer_entry_guess,
-                                     crt_min_byte_width,
-                                     {device_type,
-                                      co.hoist_literals_,
-                                      co.opt_level_,
-                                      co.with_dynamic_watchdog_,
-                                      co.explain_type_,
-                                      co.register_intel_jit_listener_},
-                                     eo,
-                                     column_fetcher,
-                                     has_cardinality_estimation);
-      CHECK(query_comp_desc_owned);
-      crt_min_byte_width = query_comp_desc_owned->getMinByteWidth();
-    } catch (CompilationRetryNoCompaction&) {
-      crt_min_byte_width = MAX_BYTE_WIDTH_SUPPORTED;
-      continue;
+    if (eo.executor_type == ExecutorType::Native) {
+      try {
+        INJECT_TIMER(execution_dispatch_comp);
+        std::tie(query_comp_desc_owned, query_mem_desc_owned) =
+            execution_dispatch.compile(max_groups_buffer_entry_guess,
+                                       crt_min_byte_width,
+                                       {device_type,
+                                        co.hoist_literals,
+                                        co.opt_level,
+                                        co.with_dynamic_watchdog,
+                                        co.allow_lazy_fetch,
+                                        co.add_delete_column,
+                                        co.explain_type,
+                                        co.register_intel_jit_listener},
+                                       eo,
+                                       column_fetcher,
+                                       has_cardinality_estimation);
+        CHECK(query_comp_desc_owned);
+        crt_min_byte_width = query_comp_desc_owned->getMinByteWidth();
+      } catch (CompilationRetryNoCompaction&) {
+        crt_min_byte_width = MAX_BYTE_WIDTH_SUPPORTED;
+        continue;
+      }
+    } else {
+      plan_state_.reset(new PlanState(false, this));
+      plan_state_->allocateLocalColumnIds(ra_exe_unit.input_col_descs);
+      CHECK(!query_comp_desc_owned);
+      query_comp_desc_owned.reset(new QueryCompilationDescriptor());
+      CHECK(!query_mem_desc_owned);
+      query_mem_desc_owned.reset(
+          new QueryMemoryDescriptor(this, 0, QueryDescriptionType::Projection, false));
     }
     if (eo.just_explain) {
       return executeExplain(*query_comp_desc_owned);
@@ -1194,7 +1348,10 @@ ResultSetPtr Executor::executeWorkUnitImpl(
       plan_state_->target_exprs_.push_back(target_expr);
     }
 
-    auto dispatch = [&execution_dispatch, &column_fetcher, &eo](
+    auto dispatch = [&execution_dispatch,
+                     &column_fetcher,
+                     &eo,
+                     parent_thread_id = logger::thread_id()](
                         const ExecutorDeviceType chosen_device_type,
                         int chosen_device_id,
                         const QueryCompilationDescriptor& query_comp_desc,
@@ -1202,6 +1359,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
                         const FragmentsList& frag_list,
                         const ExecutorDispatchMode kernel_dispatch_mode,
                         const int64_t rowid_lookup_key) {
+      DEBUG_TIMER_NEW_THREAD(parent_thread_id);
       INJECT_TIMER(execution_dispatch_run);
       execution_dispatch.run(chosen_device_type,
                              chosen_device_id,
@@ -1220,7 +1378,8 @@ ResultSetPtr Executor::executeWorkUnitImpl(
         query_comp_desc_owned->getDeviceType() == ExecutorDeviceType::GPU
             ? cat.getDataMgr().getMemoryInfo(Data_Namespace::MemoryLevel::GPU_LEVEL)
             : std::vector<Data_Namespace::MemoryInfo>{},
-        eo.gpu_input_mem_limit_percent);
+        eo.gpu_input_mem_limit_percent,
+        eo.outer_fragment_indices);
 
     if (!eo.just_validate) {
       int available_cpus = cpu_threads();
@@ -1229,21 +1388,49 @@ ResultSetPtr Executor::executeWorkUnitImpl(
       const auto context_count =
           get_context_count(device_type, available_cpus, available_gpus.size());
       try {
-        dispatchFragments(dispatch,
-                          execution_dispatch,
-                          query_infos,
-                          eo,
-                          is_agg,
-                          allow_single_frag_table_opt,
-                          context_count,
-                          *query_comp_desc_owned,
-                          *query_mem_desc_owned,
-                          fragment_descriptor,
-                          available_gpus,
-                          available_cpus);
+        if (g_use_tbb_pool) {
+#ifdef HAVE_TBB
+          VLOG(1) << "Using TBB thread pool for kernel dispatch.";
+          dispatchFragments<threadpool::TbbThreadPool<void>>(dispatch,
+                                                             execution_dispatch,
+                                                             query_infos,
+                                                             eo,
+                                                             is_agg,
+                                                             allow_single_frag_table_opt,
+                                                             context_count,
+                                                             *query_comp_desc_owned,
+                                                             *query_mem_desc_owned,
+                                                             fragment_descriptor,
+                                                             available_gpus,
+                                                             available_cpus);
+#else
+          throw std::runtime_error(
+              "This build is not TBB enabled. Restart the server with "
+              "\"enable-modern-thread-pool\" disabled.");
+#endif
+        } else {
+          dispatchFragments<threadpool::FuturesThreadPool<void>>(
+              dispatch,
+              execution_dispatch,
+              query_infos,
+              eo,
+              is_agg,
+              allow_single_frag_table_opt,
+              context_count,
+              *query_comp_desc_owned,
+              *query_mem_desc_owned,
+              fragment_descriptor,
+              available_gpus,
+              available_cpus);
+        }
       } catch (QueryExecutionError& e) {
-        if (eo.with_dynamic_watchdog && interrupted_ &&
+        if (eo.with_dynamic_watchdog && interrupted_.load() &&
             e.getErrorCode() == ERR_OUT_OF_TIME) {
+          resetInterrupt();
+          throw QueryExecutionError(ERR_INTERRUPTED);
+        }
+        if (eo.allow_runtime_query_interrupt && interrupted_.load()) {
+          resetInterrupt();
           throw QueryExecutionError(ERR_INTERRUPTED);
         }
         cat.getDataMgr().freeAllBuffers();
@@ -1286,8 +1473,8 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
                                           const CompilationOptions& co,
                                           const ExecutionOptions& eo,
                                           const Catalog_Namespace::Catalog& cat,
-                                          PerFragmentCB& cb) {
-  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in);
+                                          PerFragmentCallBack& cb) {
+  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in, co);
   ColumnCacheMap column_cache;
 
   std::vector<InputTableInfo> table_infos{table_info};
@@ -1306,7 +1493,7 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
        ++fragment_index) {
     // We may want to consider in the future allowing this to execute on devices other
     // than CPU
-    execution_dispatch.run(co.device_type_,
+    execution_dispatch.run(co.device_type,
                            0,
                            eo,
                            column_fetcher,
@@ -1324,6 +1511,32 @@ void Executor::executeWorkUnitPerFragment(const RelAlgExecutionUnit& ra_exe_unit
     const auto fragment_results = all_fragment_results[fragment_index];
     cb(fragment_results.first, outer_fragments[fragment_index]);
   }
+}
+
+ResultSetPtr Executor::executeTableFunction(
+    const TableFunctionExecutionUnit exe_unit,
+    const std::vector<InputTableInfo>& table_infos,
+    const CompilationOptions& co,
+    const ExecutionOptions& eo,
+    const Catalog_Namespace::Catalog& cat) {
+  INJECT_TIMER(Exec_executeTableFunction);
+  nukeOldState(false, table_infos, nullptr);
+
+  ColumnCacheMap column_cache;  // Note: if we add retries to the table function
+                                // framework, we may want to move this up a level
+
+  ColumnFetcher column_fetcher(this, column_cache);
+  TableFunctionCompilationContext compilation_context;
+  compilation_context.compile(exe_unit, co, this);
+
+  TableFunctionExecutionContext exe_context(getRowSetMemoryOwner());
+  CHECK_EQ(table_infos.size(), size_t(1));
+  return exe_context.execute(exe_unit,
+                             table_infos.front(),
+                             &compilation_context,
+                             column_fetcher,
+                             co.device_type,
+                             this);
 }
 
 ResultSetPtr Executor::executeExplain(const QueryCompilationDescriptor& query_comp_desc) {
@@ -1407,7 +1620,7 @@ void fill_entries_for_empty_input(std::vector<TargetInfo>& target_infos,
     } else if (agg_info.agg_kind == kAVG) {
       entry.push_back(inline_null_val(agg_info.sql_type, float_argument_input));
       entry.push_back(0);
-    } else if (agg_info.agg_kind == kSAMPLE) {
+    } else if (agg_info.agg_kind == kSINGLE_VALUE || agg_info.agg_kind == kSAMPLE) {
       if (agg_info.sql_type.is_geometry()) {
         for (int i = 0; i < agg_info.sql_type.get_physical_coord_cols() * 2; i++) {
           entry.push_back(0);
@@ -1467,6 +1680,7 @@ ResultSetPtr Executor::collectAllDeviceResults(
     const QueryMemoryDescriptor& query_mem_desc,
     const ExecutorDeviceType device_type,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner) {
+  auto timer = DEBUG_TIMER(__func__);
   auto& result_per_device = execution_dispatch.getFragmentResults();
   if (result_per_device.empty() && query_mem_desc.getQueryDescriptionType() ==
                                        QueryDescriptionType::NonGroupedAggregate) {
@@ -1474,8 +1688,12 @@ ResultSetPtr Executor::collectAllDeviceResults(
   }
   const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
   if (use_speculative_top_n(ra_exe_unit, query_mem_desc)) {
-    return reduceSpeculativeTopN(
-        ra_exe_unit, result_per_device, row_set_mem_owner, query_mem_desc);
+    try {
+      return reduceSpeculativeTopN(
+          ra_exe_unit, result_per_device, row_set_mem_owner, query_mem_desc);
+    } catch (const std::bad_alloc&) {
+      throw SpeculativeTopNFailed("Failed during multi-device reduction.");
+    }
   }
   const auto shard_count =
       device_type == ExecutorDeviceType::GPU
@@ -1645,6 +1863,7 @@ bool has_lazy_fetched_columns(const std::vector<ColumnLazyFetchInfo>& fetched_co
 
 }  // namespace
 
+template <typename THREAD_POOL>
 void Executor::dispatchFragments(
     const std::function<void(const ExecutorDeviceType chosen_device_type,
                              int chosen_device_id,
@@ -1664,7 +1883,7 @@ void Executor::dispatchFragments(
     QueryFragmentDescriptor& fragment_descriptor,
     std::unordered_set<int>& available_gpus,
     int& available_cpus) {
-  std::vector<std::future<void>> query_threads;
+  THREAD_POOL query_threads;
   const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
   CHECK(!ra_exe_unit.input_descs.empty());
 
@@ -1703,15 +1922,14 @@ void Executor::dispatchFragments(
             const int device_id,
             const FragmentsList& frag_list,
             const int64_t rowid_lookup_key) {
-          query_threads.push_back(std::async(std::launch::async,
-                                             dispatch,
-                                             ExecutorDeviceType::GPU,
-                                             device_id,
-                                             query_comp_desc,
-                                             query_mem_desc,
-                                             frag_list,
-                                             ExecutorDispatchMode::MultifragmentKernel,
-                                             rowid_lookup_key));
+          query_threads.append(dispatch,
+                               ExecutorDeviceType::GPU,
+                               device_id,
+                               query_comp_desc,
+                               query_mem_desc,
+                               frag_list,
+                               ExecutorDispatchMode::MultifragmentKernel,
+                               rowid_lookup_key);
         };
     fragment_descriptor.assignFragsToMultiDispatch(multifrag_kernel_dispatch);
   } else {
@@ -1745,15 +1963,14 @@ void Executor::dispatchFragments(
       }
       CHECK_GE(device_id, 0);
 
-      query_threads.push_back(std::async(std::launch::async,
-                                         dispatch,
-                                         device_type,
-                                         device_id,
-                                         query_comp_desc,
-                                         query_mem_desc,
-                                         frag_list,
-                                         ExecutorDispatchMode::KernelPerFragment,
-                                         rowid_lookup_key));
+      query_threads.append(dispatch,
+                           device_type,
+                           device_id,
+                           query_comp_desc,
+                           query_mem_desc,
+                           frag_list,
+                           ExecutorDispatchMode::KernelPerFragment,
+                           rowid_lookup_key);
 
       ++frag_list_idx;
     };
@@ -1761,12 +1978,7 @@ void Executor::dispatchFragments(
     fragment_descriptor.assignFragsToKernelDispatch(fragment_per_kernel_dispatch,
                                                     ra_exe_unit);
   }
-  for (auto& child : query_threads) {
-    child.wait();
-  }
-  for (auto& child : query_threads) {
-    child.get();
-  }
+  query_threads.join();
 }
 
 std::vector<size_t> Executor::getTableFragmentIndices(
@@ -1914,9 +2126,11 @@ Executor::getRowCountAndOffsetForAllFrags(
   for (const auto& selected_frag_ids : frag_ids_crossjoin) {
     std::vector<int64_t> num_rows;
     std::vector<uint64_t> frag_offsets;
-    CHECK_EQ(selected_frag_ids.size(), input_descs.size());
+    if (!ra_exe_unit.union_all) {
+      CHECK_EQ(selected_frag_ids.size(), input_descs.size());
+    }
     for (size_t tab_idx = 0; tab_idx < input_descs.size(); ++tab_idx) {
-      const auto frag_id = selected_frag_ids[tab_idx];
+      const auto frag_id = ra_exe_unit.union_all ? 0 : selected_frag_ids[tab_idx];
       const auto fragments_it =
           all_tables_fragments.find(input_descs[tab_idx].getTableId());
       CHECK(fragments_it != all_tables_fragments.end());
@@ -1967,7 +2181,13 @@ bool Executor::needFetchAllFragments(const InputColDescriptor& inner_col_desc,
   return fragments.size() > 1;
 }
 
-Executor::FetchResult Executor::fetchChunks(
+std::ostream& operator<<(std::ostream& os, FetchResult const& fetch_result) {
+  return os << "col_buffers" << shared::printContainer(fetch_result.col_buffers)
+            << " num_rows" << shared::printContainer(fetch_result.num_rows)
+            << " frag_offsets" << shared::printContainer(fetch_result.frag_offsets);
+}
+
+FetchResult Executor::fetchChunks(
     const ColumnFetcher& column_fetcher,
     const RelAlgExecutionUnit& ra_exe_unit,
     const int device_id,
@@ -1977,6 +2197,7 @@ Executor::FetchResult Executor::fetchChunks(
     const Catalog_Namespace::Catalog& cat,
     std::list<ChunkIter>& chunk_iterators,
     std::list<std::shared_ptr<Chunk_NS::Chunk>>& chunks) {
+  auto timer = DEBUG_TIMER(__func__);
   INJECT_TIMER(fetchChunks);
   const auto& col_global_ids = ra_exe_unit.input_col_descs;
   std::vector<std::vector<size_t>> selected_fragments_crossjoin;
@@ -1998,6 +2219,12 @@ Executor::FetchResult Executor::fetchChunks(
     std::vector<const int8_t*> frag_col_buffers(
         plan_state_->global_to_local_col_ids_.size());
     for (const auto& col_id : col_global_ids) {
+      // check whether the interrupt flag turns on (non kernel-time query interrupt)
+      if ((g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) &&
+          interrupted_.load()) {
+        resetInterrupt();
+        throw QueryExecutionError(ERR_INTERRUPTED);
+      }
       CHECK(col_id);
       const int table_id = col_id->getScanDesc().getTableId();
       const auto cd = try_get_column_descriptor(col_id.get(), cat);
@@ -2054,6 +2281,155 @@ Executor::FetchResult Executor::fetchChunks(
   return {all_frag_col_buffers, all_num_rows, all_frag_offsets};
 }
 
+// fetchChunks() is written under the assumption that multiple inputs implies a JOIN.
+// This is written under the assumption that multiple inputs implies a UNION ALL.
+FetchResult Executor::fetchUnionChunks(
+    const ColumnFetcher& column_fetcher,
+    const RelAlgExecutionUnit& ra_exe_unit,
+    const int device_id,
+    const Data_Namespace::MemoryLevel memory_level,
+    const std::map<int, const TableFragments*>& all_tables_fragments,
+    const FragmentsList& selected_fragments,
+    const Catalog_Namespace::Catalog& cat,
+    std::list<ChunkIter>& chunk_iterators,
+    std::list<std::shared_ptr<Chunk_NS::Chunk>>& chunks) {
+  auto timer = DEBUG_TIMER(__func__);
+  INJECT_TIMER(fetchUnionChunks);
+
+  std::vector<std::vector<const int8_t*>> all_frag_col_buffers;
+  std::vector<std::vector<int64_t>> all_num_rows;
+  std::vector<std::vector<uint64_t>> all_frag_offsets;
+
+  CHECK(!selected_fragments.empty());
+  CHECK_LE(2u, ra_exe_unit.input_descs.size());
+  CHECK_LE(2u, ra_exe_unit.input_col_descs.size());
+  using TableId = int;
+  TableId const selected_table_id = selected_fragments.front().table_id;
+  bool const input_descs_index =
+      selected_table_id == ra_exe_unit.input_descs[1].getTableId();
+  if (!input_descs_index) {
+    CHECK_EQ(selected_table_id, ra_exe_unit.input_descs[0].getTableId());
+  }
+  bool const input_col_descs_index =
+      selected_table_id ==
+      (*std::next(ra_exe_unit.input_col_descs.begin()))->getScanDesc().getTableId();
+  if (!input_col_descs_index) {
+    CHECK_EQ(selected_table_id,
+             ra_exe_unit.input_col_descs.front()->getScanDesc().getTableId());
+  }
+  VLOG(2) << "selected_fragments.size()=" << selected_fragments.size()
+          << " selected_table_id=" << selected_table_id
+          << " input_descs_index=" << int(input_descs_index)
+          << " input_col_descs_index=" << int(input_col_descs_index)
+          << " ra_exe_unit.input_descs="
+          << shared::printContainer(ra_exe_unit.input_descs)
+          << " ra_exe_unit.input_col_descs="
+          << shared::printContainer(ra_exe_unit.input_col_descs);
+
+  // Partition col_global_ids by table_id
+  std::unordered_map<TableId, std::list<std::shared_ptr<const InputColDescriptor>>>
+      table_id_to_input_col_descs;
+  for (auto const& input_col_desc : ra_exe_unit.input_col_descs) {
+    TableId const table_id = input_col_desc->getScanDesc().getTableId();
+    table_id_to_input_col_descs[table_id].push_back(input_col_desc);
+  }
+  for (auto const& pair : table_id_to_input_col_descs) {
+    std::vector<std::vector<size_t>> selected_fragments_crossjoin;
+    std::vector<size_t> local_col_to_frag_pos;
+
+    buildSelectedFragsMappingForUnion(selected_fragments_crossjoin,
+                                      local_col_to_frag_pos,
+                                      pair.second,
+                                      selected_fragments,
+                                      ra_exe_unit);
+
+    CartesianProduct<std::vector<std::vector<size_t>>> frag_ids_crossjoin(
+        selected_fragments_crossjoin);
+
+    for (const auto& selected_frag_ids : frag_ids_crossjoin) {
+      std::vector<const int8_t*> frag_col_buffers(
+          plan_state_->global_to_local_col_ids_.size());
+      for (const auto& col_id : pair.second) {
+        CHECK(col_id);
+        const int table_id = col_id->getScanDesc().getTableId();
+        CHECK_EQ(table_id, pair.first);
+        const auto cd = try_get_column_descriptor(col_id.get(), cat);
+        if (cd && cd->isVirtualCol) {
+          CHECK_EQ("rowid", cd->columnName);
+          continue;
+        }
+        const auto fragments_it = all_tables_fragments.find(table_id);
+        CHECK(fragments_it != all_tables_fragments.end());
+        const auto fragments = fragments_it->second;
+        auto it = plan_state_->global_to_local_col_ids_.find(*col_id);
+        CHECK(it != plan_state_->global_to_local_col_ids_.end());
+        CHECK_LT(static_cast<size_t>(it->second),
+                 plan_state_->global_to_local_col_ids_.size());
+        const size_t frag_id = ra_exe_unit.union_all
+                                   ? 0
+                                   : selected_frag_ids[local_col_to_frag_pos[it->second]];
+        if (!fragments->size()) {
+          return {};
+        }
+        CHECK_LT(frag_id, fragments->size());
+        auto memory_level_for_column = memory_level;
+        if (plan_state_->columns_to_fetch_.find(
+                std::make_pair(col_id->getScanDesc().getTableId(), col_id->getColId())) ==
+            plan_state_->columns_to_fetch_.end()) {
+          memory_level_for_column = Data_Namespace::CPU_LEVEL;
+        }
+        if (col_id->getScanDesc().getSourceType() == InputSourceType::RESULT) {
+          frag_col_buffers[it->second] = column_fetcher.getResultSetColumn(
+              col_id.get(), memory_level_for_column, device_id);
+        } else {
+          if (needFetchAllFragments(*col_id, ra_exe_unit, selected_fragments)) {
+            frag_col_buffers[it->second] =
+                column_fetcher.getAllTableColumnFragments(table_id,
+                                                          col_id->getColId(),
+                                                          all_tables_fragments,
+                                                          memory_level_for_column,
+                                                          device_id);
+          } else {
+            frag_col_buffers[it->second] =
+                column_fetcher.getOneTableColumnFragment(table_id,
+                                                         frag_id,
+                                                         col_id->getColId(),
+                                                         all_tables_fragments,
+                                                         chunks,
+                                                         chunk_iterators,
+                                                         memory_level_for_column,
+                                                         device_id);
+          }
+        }
+      }
+      all_frag_col_buffers.push_back(frag_col_buffers);
+    }
+    std::vector<std::vector<int64_t>> num_rows;
+    std::vector<std::vector<uint64_t>> frag_offsets;
+    std::tie(num_rows, frag_offsets) = getRowCountAndOffsetForAllFrags(
+        ra_exe_unit, frag_ids_crossjoin, ra_exe_unit.input_descs, all_tables_fragments);
+    all_num_rows.insert(all_num_rows.end(), num_rows.begin(), num_rows.end());
+    all_frag_offsets.insert(
+        all_frag_offsets.end(), frag_offsets.begin(), frag_offsets.end());
+  }
+  // UNION ALL hacks.
+  VLOG(2) << "all_frag_col_buffers=" << shared::printContainer(all_frag_col_buffers);
+  for (size_t i = 0; i < all_frag_col_buffers.front().size(); ++i) {
+    all_frag_col_buffers[i & 1][i] = all_frag_col_buffers[i & 1][i ^ 1];
+  }
+  if (input_descs_index == input_col_descs_index) {
+    std::swap(all_frag_col_buffers[0], all_frag_col_buffers[1]);
+  }
+
+  VLOG(2) << "all_frag_col_buffers=" << shared::printContainer(all_frag_col_buffers)
+          << " all_num_rows=" << shared::printContainer(all_num_rows)
+          << " all_frag_offsets=" << shared::printContainer(all_frag_offsets)
+          << " input_col_descs_index=" << input_col_descs_index;
+  return {{all_frag_col_buffers[input_descs_index]},
+          {{all_num_rows[0][input_descs_index]}},
+          {{all_frag_offsets[0][input_descs_index]}}};
+}
+
 std::vector<size_t> Executor::getFragmentCount(const FragmentsList& selected_fragments,
                                                const size_t scan_idx,
                                                const RelAlgExecutionUnit& ra_exe_unit) {
@@ -2099,6 +2475,43 @@ void Executor::buildSelectedFragsMapping(
   }
 }
 
+void Executor::buildSelectedFragsMappingForUnion(
+    std::vector<std::vector<size_t>>& selected_fragments_crossjoin,
+    std::vector<size_t>& local_col_to_frag_pos,
+    const std::list<std::shared_ptr<const InputColDescriptor>>& col_global_ids,
+    const FragmentsList& selected_fragments,
+    const RelAlgExecutionUnit& ra_exe_unit) {
+  local_col_to_frag_pos.resize(plan_state_->global_to_local_col_ids_.size());
+  size_t frag_pos{0};
+  const auto& input_descs = ra_exe_unit.input_descs;
+  for (size_t scan_idx = 0; scan_idx < input_descs.size(); ++scan_idx) {
+    const int table_id = input_descs[scan_idx].getTableId();
+    // selected_fragments here is from assignFragsToKernelDispatch
+    // execution_kernel.fragments
+    if (selected_fragments[0].table_id != table_id) {  // TODO 0
+      continue;
+    }
+    // CHECK_EQ(selected_fragments[scan_idx].table_id, table_id);
+    selected_fragments_crossjoin.push_back(
+        // getFragmentCount(selected_fragments, scan_idx, ra_exe_unit));
+        {size_t(1)});  // TODO
+    for (const auto& col_id : col_global_ids) {
+      CHECK(col_id);
+      const auto& input_desc = col_id->getScanDesc();
+      if (input_desc.getTableId() != table_id ||
+          input_desc.getNestLevel() != static_cast<int>(scan_idx)) {
+        continue;
+      }
+      auto it = plan_state_->global_to_local_col_ids_.find(*col_id);
+      CHECK(it != plan_state_->global_to_local_col_ids_.end());
+      CHECK_LT(static_cast<size_t>(it->second),
+               plan_state_->global_to_local_col_ids_.size());
+      local_col_to_frag_pos[it->second] = frag_pos;
+    }
+    ++frag_pos;
+  }
+}
+
 namespace {
 
 class OutVecOwner {
@@ -2114,102 +2527,6 @@ class OutVecOwner {
   std::vector<int64_t*> out_vec_;
 };
 }  // namespace
-
-template <typename META_TYPE_CLASS>
-class AggregateReductionEgress {
- public:
-  using ReturnType = void;
-
-  // TODO:  Avoid parameter struct indirection and forward directly
-  ReturnType operator()(int const entry_count,
-                        int& error_code,
-                        TargetInfo const& agg_info,
-                        size_t& out_vec_idx,
-                        std::vector<int64_t*>& out_vec,
-                        std::vector<int64_t>& reduced_outs,
-                        QueryExecutionContext* query_exe_context) {
-    int64_t val1;
-    const bool float_argument_input = takes_float_argument(agg_info);
-    if (is_distinct_target(agg_info)) {
-      CHECK(agg_info.agg_kind == kCOUNT || agg_info.agg_kind == kAPPROX_COUNT_DISTINCT);
-      val1 = out_vec[out_vec_idx][0];
-      error_code = 0;
-    } else {
-      const auto chosen_bytes = static_cast<size_t>(
-          query_exe_context->query_mem_desc_.getPaddedSlotWidthBytes(out_vec_idx));
-      std::tie(val1, error_code) =
-          Executor::reduceResults(agg_info.agg_kind,
-                                  agg_info.sql_type,
-                                  query_exe_context->getAggInitValForIndex(out_vec_idx),
-                                  float_argument_input ? sizeof(int32_t) : chosen_bytes,
-                                  out_vec[out_vec_idx],
-                                  entry_count,
-                                  false,
-                                  float_argument_input);
-    }
-    if (error_code) {
-      return;
-    }
-    reduced_outs.push_back(val1);
-    if (agg_info.agg_kind == kAVG ||
-        (agg_info.agg_kind == kSAMPLE &&
-         (agg_info.sql_type.is_varlen() || agg_info.sql_type.is_geometry()))) {
-      const auto chosen_bytes = static_cast<size_t>(
-          query_exe_context->query_mem_desc_.getPaddedSlotWidthBytes(out_vec_idx + 1));
-      int64_t val2;
-      std::tie(val2, error_code) = Executor::reduceResults(
-          agg_info.agg_kind == kAVG ? kCOUNT : agg_info.agg_kind,
-          agg_info.sql_type,
-          query_exe_context->getAggInitValForIndex(out_vec_idx + 1),
-          float_argument_input ? sizeof(int32_t) : chosen_bytes,
-          out_vec[out_vec_idx + 1],
-          entry_count,
-          false,
-          false);
-      if (error_code) {
-        return;
-      }
-      reduced_outs.push_back(val2);
-      ++out_vec_idx;
-    }
-    ++out_vec_idx;
-  }
-};
-
-// Handles reduction for geo-types
-template <>
-class AggregateReductionEgress<Experimental::MetaTypeClass<Experimental::Geometry>> {
- public:
-  using ReturnType = void;
-
-  ReturnType operator()(int const entry_count,
-                        int& error_code,
-                        TargetInfo const& agg_info,
-                        size_t& out_vec_idx,
-                        std::vector<int64_t*>& out_vec,
-                        std::vector<int64_t>& reduced_outs,
-                        QueryExecutionContext* query_exe_context) {
-    for (int i = 0; i < agg_info.sql_type.get_physical_coord_cols() * 2; i++) {
-      int64_t val1;
-      const auto chosen_bytes = static_cast<size_t>(
-          query_exe_context->query_mem_desc_.getPaddedSlotWidthBytes(out_vec_idx));
-      std::tie(val1, error_code) =
-          Executor::reduceResults(agg_info.agg_kind,
-                                  agg_info.sql_type,
-                                  query_exe_context->getAggInitValForIndex(out_vec_idx),
-                                  chosen_bytes,
-                                  out_vec[out_vec_idx],
-                                  entry_count,
-                                  false,
-                                  false);
-      if (error_code) {
-        return;
-      }
-      reduced_outs.push_back(val1);
-      out_vec_idx++;
-    }
-  }
-};
 
 int32_t Executor::executePlanWithoutGroupBy(
     const RelAlgExecutionUnit& ra_exe_unit,
@@ -2228,6 +2545,7 @@ int32_t Executor::executePlanWithoutGroupBy(
     const uint32_t num_tables,
     RenderInfo* render_info) {
   INJECT_TIMER(executePlanWithoutGroupBy);
+  auto timer = DEBUG_TIMER(__func__);
   CHECK(!results);
   if (col_buffers.empty()) {
     return 0;
@@ -2248,8 +2566,10 @@ int32_t Executor::executePlanWithoutGroupBy(
   const auto hoist_buf = serializeLiterals(compilation_result.literal_values, device_id);
   const auto join_hash_table_ptrs = getJoinHashTablePtrs(device_type, device_id);
   std::unique_ptr<OutVecOwner> output_memory_scope;
-  if (g_enable_dynamic_watchdog && interrupted_) {
-    return ERR_INTERRUPTED;
+  if ((g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) &&
+      interrupted_.load()) {
+    resetInterrupt();
+    throw QueryExecutionError(ERR_INTERRUPTED);
   }
   if (device_type == ExecutorDeviceType::CPU) {
     out_vec = query_exe_context->launchCpuCode(ra_exe_unit,
@@ -2266,22 +2586,24 @@ int32_t Executor::executePlanWithoutGroupBy(
     output_memory_scope.reset(new OutVecOwner(out_vec));
   } else {
     try {
-      out_vec = query_exe_context->launchGpuCode(ra_exe_unit,
-                                                 compilation_result.native_functions,
-                                                 hoist_literals,
-                                                 hoist_buf,
-                                                 col_buffers,
-                                                 num_rows,
-                                                 frag_offsets,
-                                                 0,
-                                                 data_mgr,
-                                                 blockSize(),
-                                                 gridSize(),
-                                                 device_id,
-                                                 &error_code,
-                                                 num_tables,
-                                                 join_hash_table_ptrs,
-                                                 render_allocator_map_ptr);
+      out_vec = query_exe_context->launchGpuCode(
+          ra_exe_unit,
+          compilation_result.native_functions,
+          hoist_literals,
+          hoist_buf,
+          col_buffers,
+          num_rows,
+          frag_offsets,
+          0,
+          data_mgr,
+          blockSize(),
+          gridSize(),
+          device_id,
+          compilation_result.gpu_smem_context.getSharedMemorySize(),
+          &error_code,
+          num_tables,
+          join_hash_table_ptrs,
+          render_allocator_map_ptr);
       output_memory_scope.reset(new OutVecOwner(out_vec));
     } catch (const OutOfMemory&) {
       return ERR_OUT_OF_GPU_MEM;
@@ -2292,7 +2614,8 @@ int32_t Executor::executePlanWithoutGroupBy(
   if (error_code == Executor::ERR_OVERFLOW_OR_UNDERFLOW ||
       error_code == Executor::ERR_DIV_BY_ZERO ||
       error_code == Executor::ERR_OUT_OF_TIME ||
-      error_code == Executor::ERR_INTERRUPTED) {
+      error_code == Executor::ERR_INTERRUPTED ||
+      error_code == Executor::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES) {
     return error_code;
   }
   if (ra_exe_unit.estimator) {
@@ -2303,9 +2626,12 @@ int32_t Executor::executePlanWithoutGroupBy(
   }
   std::vector<int64_t> reduced_outs;
   const auto num_frags = col_buffers.size();
-  const size_t entry_count = device_type == ExecutorDeviceType::GPU
-                                 ? num_frags * blockSize() * gridSize()
-                                 : num_frags;
+  const size_t entry_count =
+      device_type == ExecutorDeviceType::GPU
+          ? (compilation_result.gpu_smem_context.isSharedMemoryUsed()
+                 ? 1
+                 : blockSize() * gridSize() * num_frags)
+          : num_frags;
   if (size_t(1) == entry_count) {
     for (auto out : out_vec) {
       CHECK(out);
@@ -2318,22 +2644,64 @@ int32_t Executor::executePlanWithoutGroupBy(
       const auto agg_info = get_target_info(target_expr, g_bigint_count);
       CHECK(agg_info.is_agg);
 
-      auto meta_class(
-          Experimental::GeoMetaTypeClassFactory::getMetaTypeClass(agg_info.sql_type));
-      auto agg_reduction_impl =
-          Experimental::GeoVsNonGeoClassHandler<AggregateReductionEgress>();
-      agg_reduction_impl(meta_class,
-                         entry_count,
-                         error_code,
-                         agg_info,
-                         out_vec_idx,
-                         out_vec,
-                         reduced_outs,
-                         query_exe_context);
-      if (error_code) {
-        break;
+      const int num_iterations = agg_info.sql_type.is_geometry()
+                                     ? agg_info.sql_type.get_physical_coord_cols()
+                                     : 1;
+
+      for (int i = 0; i < num_iterations; i++) {
+        int64_t val1;
+        const bool float_argument_input = takes_float_argument(agg_info);
+        if (is_distinct_target(agg_info)) {
+          CHECK(agg_info.agg_kind == kCOUNT ||
+                agg_info.agg_kind == kAPPROX_COUNT_DISTINCT);
+          val1 = out_vec[out_vec_idx][0];
+          error_code = 0;
+        } else {
+          const auto chosen_bytes = static_cast<size_t>(
+              query_exe_context->query_mem_desc_.getPaddedSlotWidthBytes(out_vec_idx));
+          std::tie(val1, error_code) = Executor::reduceResults(
+              agg_info.agg_kind,
+              agg_info.sql_type,
+              query_exe_context->getAggInitValForIndex(out_vec_idx),
+              float_argument_input ? sizeof(int32_t) : chosen_bytes,
+              out_vec[out_vec_idx],
+              entry_count,
+              false,
+              float_argument_input);
+        }
+        if (error_code) {
+          break;
+        }
+        reduced_outs.push_back(val1);
+        if (agg_info.agg_kind == kAVG ||
+            (agg_info.agg_kind == kSAMPLE &&
+             (agg_info.sql_type.is_varlen() || agg_info.sql_type.is_geometry()))) {
+          const auto chosen_bytes = static_cast<size_t>(
+              query_exe_context->query_mem_desc_.getPaddedSlotWidthBytes(out_vec_idx +
+                                                                         1));
+          int64_t val2;
+          std::tie(val2, error_code) = Executor::reduceResults(
+              agg_info.agg_kind == kAVG ? kCOUNT : agg_info.agg_kind,
+              agg_info.sql_type,
+              query_exe_context->getAggInitValForIndex(out_vec_idx + 1),
+              float_argument_input ? sizeof(int32_t) : chosen_bytes,
+              out_vec[out_vec_idx + 1],
+              entry_count,
+              false,
+              false);
+          if (error_code) {
+            break;
+          }
+          reduced_outs.push_back(val2);
+          ++out_vec_idx;
+        }
+        ++out_vec_idx;
       }
     }
+  }
+
+  if (error_code) {
+    return error_code;
   }
 
   CHECK_EQ(size_t(1), query_exe_context->query_buffers_->result_sets_.size());
@@ -2366,10 +2734,12 @@ int32_t Executor::executePlanWithGroupBy(
     const std::vector<std::vector<uint64_t>>& frag_offsets,
     Data_Namespace::DataMgr* data_mgr,
     const int device_id,
+    const int outer_table_id,
     const int64_t scan_limit,
     const uint32_t start_rowid,
     const uint32_t num_tables,
     RenderInfo* render_info) {
+  auto timer = DEBUG_TIMER(__func__);
   INJECT_TIMER(executePlanWithGroupBy);
   CHECK(!results);
   if (col_buffers.empty()) {
@@ -2383,7 +2753,8 @@ int32_t Executor::executePlanWithGroupBy(
   auto hoist_buf = serializeLiterals(compilation_result.literal_values, device_id);
   int32_t error_code = device_type == ExecutorDeviceType::GPU ? 0 : start_rowid;
   const auto join_hash_table_ptrs = getJoinHashTablePtrs(device_type, device_id);
-  if (g_enable_dynamic_watchdog && interrupted_) {
+  if ((g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) &&
+      interrupted_.load()) {
     return ERR_INTERRUPTED;
   }
 
@@ -2392,44 +2763,84 @@ int32_t Executor::executePlanWithGroupBy(
     render_allocator_map_ptr = render_info->render_allocator_map_ptr.get();
   }
 
+  VLOG(2) << "bool(ra_exe_unit.union_all)=" << bool(ra_exe_unit.union_all)
+          << " ra_exe_unit.input_descs="
+          << shared::printContainer(ra_exe_unit.input_descs)
+          << " ra_exe_unit.input_col_descs="
+          << shared::printContainer(ra_exe_unit.input_col_descs)
+          << " ra_exe_unit.scan_limit=" << ra_exe_unit.scan_limit
+          << " num_rows=" << shared::printContainer(num_rows)
+          << " frag_offsets=" << shared::printContainer(frag_offsets)
+          << " query_exe_context->query_buffers_->num_rows_="
+          << query_exe_context->query_buffers_->num_rows_
+          << " query_exe_context->query_mem_desc_.getEntryCount()="
+          << query_exe_context->query_mem_desc_.getEntryCount()
+          << " device_id=" << device_id << " outer_table_id=" << outer_table_id
+          << " scan_limit=" << scan_limit << " start_rowid=" << start_rowid
+          << " num_tables=" << num_tables;
+
+  RelAlgExecutionUnit ra_exe_unit_copy = ra_exe_unit;
+  // For UNION ALL, filter out input_descs and input_col_descs that are not associated
+  // with outer_table_id.
+  if (ra_exe_unit_copy.union_all) {
+    // Sort outer_table_id first, then pop the rest off of ra_exe_unit_copy.input_descs.
+    std::stable_sort(ra_exe_unit_copy.input_descs.begin(),
+                     ra_exe_unit_copy.input_descs.end(),
+                     [outer_table_id](auto const& a, auto const& b) {
+                       return a.getTableId() == outer_table_id &&
+                              b.getTableId() != outer_table_id;
+                     });
+    while (!ra_exe_unit_copy.input_descs.empty() &&
+           ra_exe_unit_copy.input_descs.back().getTableId() != outer_table_id) {
+      ra_exe_unit_copy.input_descs.pop_back();
+    }
+    // Filter ra_exe_unit_copy.input_col_descs.
+    ra_exe_unit_copy.input_col_descs.remove_if(
+        [outer_table_id](auto const& input_col_desc) {
+          return input_col_desc->getScanDesc().getTableId() != outer_table_id;
+        });
+    query_exe_context->query_mem_desc_.setEntryCount(ra_exe_unit_copy.scan_limit);
+  }
+
   if (device_type == ExecutorDeviceType::CPU) {
-    query_exe_context->launchCpuCode(ra_exe_unit,
-                                     compilation_result.native_functions,
-                                     hoist_literals,
-                                     hoist_buf,
-                                     col_buffers,
-                                     num_rows,
-                                     frag_offsets,
-                                     scan_limit,
-                                     &error_code,
-                                     num_tables,
-                                     join_hash_table_ptrs);
+    query_exe_context->launchCpuCode(
+        ra_exe_unit_copy,
+        compilation_result.native_functions,
+        hoist_literals,
+        hoist_buf,
+        col_buffers,
+        num_rows,
+        frag_offsets,
+        ra_exe_unit_copy.union_all ? ra_exe_unit_copy.scan_limit : scan_limit,
+        &error_code,
+        num_tables,
+        join_hash_table_ptrs);
   } else {
     try {
-      query_exe_context->launchGpuCode(ra_exe_unit,
-                                       compilation_result.native_functions,
-                                       hoist_literals,
-                                       hoist_buf,
-                                       col_buffers,
-                                       num_rows,
-                                       frag_offsets,
-                                       scan_limit,
-                                       data_mgr,
-                                       blockSize(),
-                                       gridSize(),
-                                       device_id,
-                                       &error_code,
-                                       num_tables,
-                                       join_hash_table_ptrs,
-                                       render_allocator_map_ptr);
+      auto out_vec = query_exe_context->launchGpuCode(
+          ra_exe_unit_copy,
+          compilation_result.native_functions,
+          hoist_literals,
+          hoist_buf,
+          col_buffers,
+          num_rows,
+          frag_offsets,
+          ra_exe_unit_copy.union_all ? ra_exe_unit_copy.scan_limit : scan_limit,
+          data_mgr,
+          blockSize(),
+          gridSize(),
+          device_id,
+          compilation_result.gpu_smem_context.getSharedMemorySize(),
+          &error_code,
+          num_tables,
+          join_hash_table_ptrs,
+          render_allocator_map_ptr);
     } catch (const OutOfMemory&) {
       return ERR_OUT_OF_GPU_MEM;
     } catch (const OutOfRenderMemory&) {
       return ERR_OUT_OF_RENDER_MEM;
     } catch (const StreamingTopNNotSupportedInRenderQuery&) {
       return ERR_STREAMING_TOP_N_NOT_SUPPORTED_IN_RENDER_QUERY;
-    } catch (const std::bad_alloc&) {
-      return ERR_SPECULATIVE_TOP_OOM;
     } catch (const std::exception& e) {
       LOG(FATAL) << "Error launching the GPU kernel: " << e.what();
     }
@@ -2438,21 +2849,25 @@ int32_t Executor::executePlanWithGroupBy(
   if (error_code == Executor::ERR_OVERFLOW_OR_UNDERFLOW ||
       error_code == Executor::ERR_DIV_BY_ZERO ||
       error_code == Executor::ERR_OUT_OF_TIME ||
-      error_code == Executor::ERR_INTERRUPTED) {
+      error_code == Executor::ERR_INTERRUPTED ||
+      error_code == Executor::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES) {
     return error_code;
   }
 
   if (error_code != Executor::ERR_OVERFLOW_OR_UNDERFLOW &&
       error_code != Executor::ERR_DIV_BY_ZERO && !render_allocator_map_ptr) {
-    results =
-        query_exe_context->getRowSet(ra_exe_unit, query_exe_context->query_mem_desc_);
+    results = query_exe_context->getRowSet(ra_exe_unit_copy,
+                                           query_exe_context->query_mem_desc_);
     CHECK(results);
+    VLOG(2) << "results->rowCount()=" << results->rowCount();
     results->holdLiterals(hoist_buf);
   }
   if (error_code < 0 && render_allocator_map_ptr) {
+    auto const adjusted_scan_limit =
+        ra_exe_unit_copy.union_all ? ra_exe_unit_copy.scan_limit : scan_limit;
     // More rows passed the filter than available slots. We don't have a count to check,
     // so assume we met the limit if a scan limit is set
-    if (scan_limit != 0) {
+    if (adjusted_scan_limit != 0) {
       return 0;
     } else {
       return error_code;
@@ -2480,345 +2895,15 @@ std::vector<int64_t> Executor::getJoinHashTablePtrs(const ExecutorDeviceType dev
   return table_ptrs;
 }
 
-namespace {
-
-template <class T>
-int64_t insert_one_dict_str(T* col_data,
-                            const std::string& columnName,
-                            const SQLTypeInfo& columnType,
-                            const Analyzer::Constant* col_cv,
-                            const Catalog_Namespace::Catalog& catalog) {
-  if (col_cv->get_is_null()) {
-    *col_data = inline_fixed_encoding_null_val(columnType);
-  } else {
-    const int dict_id = columnType.get_comp_param();
-    const auto col_datum = col_cv->get_constval();
-    const auto& str = *col_datum.stringval;
-    const auto dd = catalog.getMetadataForDict(dict_id);
-    CHECK(dd && dd->stringDict);
-    int32_t str_id = dd->stringDict->getOrAdd(str);
-    const bool checkpoint_ok = dd->stringDict->checkpoint();
-    if (!checkpoint_ok) {
-      throw std::runtime_error("Failed to checkpoint dictionary for column " +
-                               columnName);
-    }
-    const bool invalid = str_id > max_valid_int_value<T>();
-    if (invalid || str_id == inline_int_null_value<int32_t>()) {
-      if (invalid) {
-        LOG(ERROR) << "Could not encode string: " << str
-                   << ", the encoded value doesn't fit in " << sizeof(T) * 8
-                   << " bits. Will store NULL instead.";
-      }
-      str_id = inline_fixed_encoding_null_val(columnType);
-    }
-    *col_data = str_id;
-  }
-  return *col_data;
-}
-
-template <class T>
-int64_t insert_one_dict_str(T* col_data,
-                            const ColumnDescriptor* cd,
-                            const Analyzer::Constant* col_cv,
-                            const Catalog_Namespace::Catalog& catalog) {
-  return insert_one_dict_str(col_data, cd->columnName, cd->columnType, col_cv, catalog);
-}
-
-}  // namespace
-
-namespace Importer_NS {
-
-int8_t* appendDatum(int8_t* buf, Datum d, const SQLTypeInfo& ti);
-
-}  // namespace Importer_NS
-
-void Executor::executeSimpleInsert(const Planner::RootPlan* root_plan) {
-  const auto plan = root_plan->get_plan();
-  CHECK(plan);
-  const auto values_plan = dynamic_cast<const Planner::ValuesScan*>(plan);
-  if (!values_plan) {
-    throw std::runtime_error(
-        "Only simple INSERT of immediate tuples is currently supported");
-  }
-  row_set_mem_owner_ = std::make_shared<RowSetMemoryOwner>();
-  const auto& targets = values_plan->get_targetlist();
-  const int table_id = root_plan->get_result_table_id();
-  const auto& col_id_list = root_plan->get_result_col_list();
-  std::vector<const ColumnDescriptor*> col_descriptors;
-  std::vector<int> col_ids;
-  std::unordered_map<int, std::unique_ptr<uint8_t[]>> col_buffers;
-  std::unordered_map<int, std::vector<std::string>> str_col_buffers;
-  std::unordered_map<int, std::vector<ArrayDatum>> arr_col_buffers;
-  auto& cat = root_plan->getCatalog();
-  const auto table_descriptor = cat.getMetadataForTable(table_id);
-  const auto shard_tables = cat.getPhysicalTablesDescriptors(table_descriptor);
-  const TableDescriptor* shard{nullptr};
-  for (const int col_id : col_id_list) {
-    const auto cd = get_column_descriptor(col_id, table_id, cat);
-    const auto col_enc = cd->columnType.get_compression();
-    if (cd->columnType.is_string()) {
-      switch (col_enc) {
-        case kENCODING_NONE: {
-          auto it_ok =
-              str_col_buffers.insert(std::make_pair(col_id, std::vector<std::string>{}));
-          CHECK(it_ok.second);
-          break;
-        }
-        case kENCODING_DICT: {
-          const auto dd = cat.getMetadataForDict(cd->columnType.get_comp_param());
-          CHECK(dd);
-          const auto it_ok = col_buffers.emplace(
-              col_id, std::unique_ptr<uint8_t[]>(new uint8_t[cd->columnType.get_size()]));
-          CHECK(it_ok.second);
-          break;
-        }
-        default:
-          CHECK(false);
-      }
-    } else if (cd->columnType.is_geometry()) {
-      auto it_ok =
-          str_col_buffers.insert(std::make_pair(col_id, std::vector<std::string>{}));
-      CHECK(it_ok.second);
-    } else if (cd->columnType.is_array()) {
-      auto it_ok =
-          arr_col_buffers.insert(std::make_pair(col_id, std::vector<ArrayDatum>{}));
-      CHECK(it_ok.second);
-    } else {
-      const auto it_ok = col_buffers.emplace(
-          col_id,
-          std::unique_ptr<uint8_t[]>(
-              new uint8_t[cd->columnType.get_logical_size()]()));  // changed to zero-init
-                                                                   // the buffer
-      CHECK(it_ok.second);
-    }
-    col_descriptors.push_back(cd);
-    col_ids.push_back(col_id);
-  }
-  size_t col_idx = 0;
-  Fragmenter_Namespace::InsertData insert_data;
-  insert_data.databaseId = cat.getCurrentDB().dbId;
-  insert_data.tableId = table_id;
-  int64_t int_col_val{0};
-  for (auto target_entry : targets) {
-    auto col_cv = dynamic_cast<const Analyzer::Constant*>(target_entry->get_expr());
-    if (!col_cv) {
-      auto col_cast = dynamic_cast<const Analyzer::UOper*>(target_entry->get_expr());
-      CHECK(col_cast);
-      CHECK_EQ(kCAST, col_cast->get_optype());
-      col_cv = dynamic_cast<const Analyzer::Constant*>(col_cast->get_operand());
-    }
-    CHECK(col_cv);
-    const auto cd = col_descriptors[col_idx];
-    auto col_datum = col_cv->get_constval();
-    auto col_type = cd->columnType.get_type();
-    uint8_t* col_data_bytes{nullptr};
-    if (!cd->columnType.is_array() && !cd->columnType.is_geometry() &&
-        (!cd->columnType.is_string() ||
-         cd->columnType.get_compression() == kENCODING_DICT)) {
-      const auto col_data_bytes_it = col_buffers.find(col_ids[col_idx]);
-      CHECK(col_data_bytes_it != col_buffers.end());
-      col_data_bytes = col_data_bytes_it->second.get();
-    }
-    switch (col_type) {
-      case kBOOLEAN: {
-        auto col_data = col_data_bytes;
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : (col_datum.boolval ? 1 : 0);
-        break;
-      }
-      case kTINYINT: {
-        auto col_data = reinterpret_cast<int8_t*>(col_data_bytes);
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : col_datum.tinyintval;
-        int_col_val = col_datum.tinyintval;
-        break;
-      }
-      case kSMALLINT: {
-        auto col_data = reinterpret_cast<int16_t*>(col_data_bytes);
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : col_datum.smallintval;
-        int_col_val = col_datum.smallintval;
-        break;
-      }
-      case kINT: {
-        auto col_data = reinterpret_cast<int32_t*>(col_data_bytes);
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : col_datum.intval;
-        int_col_val = col_datum.intval;
-        break;
-      }
-      case kBIGINT:
-      case kDECIMAL:
-      case kNUMERIC: {
-        auto col_data = reinterpret_cast<int64_t*>(col_data_bytes);
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : col_datum.bigintval;
-        int_col_val = col_datum.bigintval;
-        break;
-      }
-      case kFLOAT: {
-        auto col_data = reinterpret_cast<float*>(col_data_bytes);
-        *col_data = col_datum.floatval;
-        break;
-      }
-      case kDOUBLE: {
-        auto col_data = reinterpret_cast<double*>(col_data_bytes);
-        *col_data = col_datum.doubleval;
-        break;
-      }
-      case kTEXT:
-      case kVARCHAR:
-      case kCHAR: {
-        switch (cd->columnType.get_compression()) {
-          case kENCODING_NONE:
-            str_col_buffers[col_ids[col_idx]].push_back(
-                col_datum.stringval ? *col_datum.stringval : "");
-            break;
-          case kENCODING_DICT: {
-            switch (cd->columnType.get_size()) {
-              case 1:
-                int_col_val = insert_one_dict_str(
-                    reinterpret_cast<uint8_t*>(col_data_bytes), cd, col_cv, cat);
-                break;
-              case 2:
-                int_col_val = insert_one_dict_str(
-                    reinterpret_cast<uint16_t*>(col_data_bytes), cd, col_cv, cat);
-                break;
-              case 4:
-                int_col_val = insert_one_dict_str(
-                    reinterpret_cast<int32_t*>(col_data_bytes), cd, col_cv, cat);
-                break;
-              default:
-                CHECK(false);
-            }
-            break;
-          }
-          default:
-            CHECK(false);
-        }
-        break;
-      }
-      case kTIME:
-      case kTIMESTAMP:
-      case kDATE: {
-        auto col_data = reinterpret_cast<int64_t*>(col_data_bytes);
-        *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
-                                          : col_datum.bigintval;
-        break;
-      }
-      case kARRAY: {
-        const auto is_null = col_cv->get_is_null();
-        const auto size = cd->columnType.get_size();
-        const SQLTypeInfo elem_ti = cd->columnType.get_elem_type();
-        if (is_null) {
-          if (size > 0) {
-            // NULL fixlen array: NULL_ARRAY sentinel followed by NULL sentinels
-            if (elem_ti.is_string() && elem_ti.get_compression() == kENCODING_DICT) {
-              throw std::runtime_error("Column " + cd->columnName +
-                                       " doesn't accept NULL values");
-            }
-            int8_t* buf = (int8_t*)checked_malloc(size);
-            put_null_array(static_cast<void*>(buf), elem_ti, "");
-            for (int8_t* p = buf + elem_ti.get_size(); (p - buf) < size;
-                 p += elem_ti.get_size()) {
-              put_null(static_cast<void*>(p), elem_ti, "");
-            }
-            arr_col_buffers[col_ids[col_idx]].emplace_back(size, buf, is_null);
-          } else {
-            arr_col_buffers[col_ids[col_idx]].emplace_back(0, nullptr, is_null);
-          }
-          break;
-        }
-        const auto l = col_cv->get_value_list();
-        size_t len = l.size() * elem_ti.get_size();
-        if (size > 0 && static_cast<size_t>(size) != len) {
-          throw std::runtime_error("Array column " + cd->columnName + " expects " +
-                                   std::to_string(size / elem_ti.get_size()) +
-                                   " values, " + "received " + std::to_string(l.size()));
-        }
-        if (elem_ti.is_string()) {
-          CHECK(kENCODING_DICT == elem_ti.get_compression());
-          CHECK(4 == elem_ti.get_size());
-
-          int8_t* buf = (int8_t*)checked_malloc(len);
-          int32_t* p = reinterpret_cast<int32_t*>(buf);
-
-          int elemIndex = 0;
-          for (auto& e : l) {
-            auto c = std::dynamic_pointer_cast<Analyzer::Constant>(e);
-            CHECK(c);
-
-            int_col_val =
-                insert_one_dict_str(&p[elemIndex], cd->columnName, elem_ti, c.get(), cat);
-
-            elemIndex++;
-          }
-          arr_col_buffers[col_ids[col_idx]].push_back(ArrayDatum(len, buf, is_null));
-
-        } else {
-          int8_t* buf = (int8_t*)checked_malloc(len);
-          int8_t* p = buf;
-          for (auto& e : l) {
-            auto c = std::dynamic_pointer_cast<Analyzer::Constant>(e);
-            CHECK(c);
-            p = Importer_NS::appendDatum(p, c->get_constval(), elem_ti);
-          }
-          arr_col_buffers[col_ids[col_idx]].push_back(ArrayDatum(len, buf, is_null));
-        }
-        break;
-      }
-      case kPOINT:
-      case kLINESTRING:
-      case kPOLYGON:
-      case kMULTIPOLYGON:
-        str_col_buffers[col_ids[col_idx]].push_back(
-            col_datum.stringval ? *col_datum.stringval : "");
-        break;
-      default:
-        CHECK(false);
-    }
-    ++col_idx;
-    if (col_idx == static_cast<size_t>(table_descriptor->shardedColumnId)) {
-      const auto shard_count = shard_tables.size();
-      const size_t shard_idx = SHARD_FOR_KEY(int_col_val, shard_count);
-      shard = shard_tables[shard_idx];
-    }
-  }
-  for (const auto& kv : col_buffers) {
-    insert_data.columnIds.push_back(kv.first);
-    DataBlockPtr p;
-    p.numbersPtr = reinterpret_cast<int8_t*>(kv.second.get());
-    insert_data.data.push_back(p);
-  }
-  for (auto& kv : str_col_buffers) {
-    insert_data.columnIds.push_back(kv.first);
-    DataBlockPtr p;
-    p.stringsPtr = &kv.second;
-    insert_data.data.push_back(p);
-  }
-  for (auto& kv : arr_col_buffers) {
-    insert_data.columnIds.push_back(kv.first);
-    DataBlockPtr p;
-    p.arraysPtr = &kv.second;
-    insert_data.data.push_back(p);
-  }
-  insert_data.numRows = 1;
-  if (shard) {
-    shard->fragmenter->insertData(insert_data);
-  } else {
-    table_descriptor->fragmenter->insertData(insert_data);
-  }
-}
-
 void Executor::nukeOldState(const bool allow_lazy_fetch,
                             const std::vector<InputTableInfo>& query_infos,
-                            const RelAlgExecutionUnit& ra_exe_unit) {
+                            const RelAlgExecutionUnit* ra_exe_unit) {
   const bool contains_left_deep_outer_join =
-      std::find_if(ra_exe_unit.join_quals.begin(),
-                   ra_exe_unit.join_quals.end(),
-                   [](const JoinCondition& join_condition) {
-                     return join_condition.type == JoinType::LEFT;
-                   }) != ra_exe_unit.join_quals.end();
+      ra_exe_unit && std::find_if(ra_exe_unit->join_quals.begin(),
+                                  ra_exe_unit->join_quals.end(),
+                                  [](const JoinCondition& join_condition) {
+                                    return join_condition.type == JoinType::LEFT;
+                                  }) != ra_exe_unit->join_quals.end();
   cgen_state_.reset(new CgenState(query_infos, contains_left_deep_outer_join));
   plan_state_.reset(
       new PlanState(allow_lazy_fetch && !contains_left_deep_outer_join, this));
@@ -2850,55 +2935,28 @@ Executor::JoinHashTableOrError Executor::buildHashTableForQualifier(
     const MemoryLevel memory_level,
     const JoinHashTableInterface::HashType preferred_hash_type,
     ColumnCacheMap& column_cache) {
-  std::shared_ptr<JoinHashTableInterface> join_hash_table;
-  const int device_count = deviceCountForMemoryLevel(memory_level);
-  CHECK_GT(device_count, 0);
   if (!g_enable_overlaps_hashjoin && qual_bin_oper->is_overlaps_oper()) {
     return {nullptr, "Overlaps hash join disabled, attempting to fall back to loop join"};
   }
+  // check whether the interrupt flag turns on (non kernel-time query interrupt)
+  if ((g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) &&
+      interrupted_.load()) {
+    resetInterrupt();
+    throw QueryExecutionError(ERR_INTERRUPTED);
+  }
   try {
-    if (qual_bin_oper->is_overlaps_oper()) {
-      join_hash_table = OverlapsJoinHashTable::getInstance(
-          qual_bin_oper, query_infos, memory_level, device_count, column_cache, this);
-    } else if (dynamic_cast<const Analyzer::ExpressionTuple*>(
-                   qual_bin_oper->get_left_operand())) {
-      join_hash_table = BaselineJoinHashTable::getInstance(qual_bin_oper,
-                                                           query_infos,
-                                                           memory_level,
-                                                           preferred_hash_type,
-                                                           device_count,
-                                                           column_cache,
-                                                           this);
-    } else {
-      try {
-        join_hash_table = JoinHashTable::getInstance(qual_bin_oper,
-                                                     query_infos,
-                                                     memory_level,
-                                                     preferred_hash_type,
-                                                     device_count,
-                                                     column_cache,
-                                                     this);
-      } catch (TooManyHashEntries&) {
-        const auto join_quals = coalesce_singleton_equi_join(qual_bin_oper);
-        CHECK_EQ(join_quals.size(), size_t(1));
-        const auto join_qual =
-            std::dynamic_pointer_cast<Analyzer::BinOper>(join_quals.front());
-        join_hash_table = BaselineJoinHashTable::getInstance(join_qual,
-                                                             query_infos,
-                                                             memory_level,
-                                                             preferred_hash_type,
-                                                             device_count,
-                                                             column_cache,
-                                                             this);
-      }
-    }
-    CHECK(join_hash_table);
-    return {join_hash_table, ""};
+    auto tbl =
+        JoinHashTableInterface::getInstance(qual_bin_oper,
+                                            query_infos,
+                                            memory_level,
+                                            preferred_hash_type,
+                                            deviceCountForMemoryLevel(memory_level),
+                                            column_cache,
+                                            this);
+    return {tbl, ""};
   } catch (const HashJoinFail& e) {
     return {nullptr, e.what()};
   }
-  CHECK(false);
-  return {nullptr, ""};
 }
 
 int8_t Executor::warpSize() const {
@@ -2949,7 +3007,7 @@ llvm::Value* Executor::castToFP(llvm::Value* val) {
       dest_ty = llvm::Type::getDoubleTy(cgen_state_->context_);
       break;
     default:
-      CHECK(false);
+      LOG(FATAL) << "Unsupported FP width: " << std::to_string(val_width);
   }
   return cgen_state_->ir_builder_.CreateSIToFP(val, dest_ty);
 }
@@ -2984,7 +3042,11 @@ llvm::Value* Executor::castToIntPtrTyIn(llvm::Value* val, const size_t bitWidth)
 #include "StringFunctions.cpp"
 #undef EXECUTE_INCLUDE
 
-RelAlgExecutionUnit Executor::addDeletedColumn(const RelAlgExecutionUnit& ra_exe_unit) {
+RelAlgExecutionUnit Executor::addDeletedColumn(const RelAlgExecutionUnit& ra_exe_unit,
+                                               const CompilationOptions& co) {
+  if (!co.add_delete_column) {
+    return ra_exe_unit;
+  }
   auto ra_exe_unit_with_deleted = ra_exe_unit;
   for (const auto& input_table : ra_exe_unit_with_deleted.input_descs) {
     if (input_table.getSourceType() != InputSourceType::TABLE) {
@@ -3034,7 +3096,7 @@ std::pair<bool, int64_t> Executor::skipFragment(
     const std::vector<uint64_t>& frag_offsets,
     const size_t frag_idx) {
   const int table_id = table_desc.getTableId();
-  for (const auto simple_qual : simple_quals) {
+  for (const auto& simple_qual : simple_quals) {
     const auto comp_expr =
         std::dynamic_pointer_cast<const Analyzer::BinOper>(simple_qual);
     if (!comp_expr) {
@@ -3194,7 +3256,146 @@ std::pair<bool, int64_t> Executor::skipFragmentInnerJoins(
   return skip_frag;
 }
 
-std::map<std::pair<int, ::QueryRenderer::QueryRenderManager*>, std::shared_ptr<Executor>>
-    Executor::executors_;
+AggregatedColRange Executor::computeColRangesCache(
+    const std::unordered_set<PhysicalInput>& phys_inputs) {
+  AggregatedColRange agg_col_range_cache;
+  CHECK(catalog_);
+  std::unordered_set<int> phys_table_ids;
+  for (const auto& phys_input : phys_inputs) {
+    phys_table_ids.insert(phys_input.table_id);
+  }
+  std::vector<InputTableInfo> query_infos;
+  for (const int table_id : phys_table_ids) {
+    query_infos.emplace_back(InputTableInfo{table_id, getTableInfo(table_id)});
+  }
+  for (const auto& phys_input : phys_inputs) {
+    const auto cd =
+        catalog_->getMetadataForColumn(phys_input.table_id, phys_input.col_id);
+    CHECK(cd);
+    if (ExpressionRange::typeSupportsRange(cd->columnType)) {
+      const auto col_var = boost::make_unique<Analyzer::ColumnVar>(
+          cd->columnType, phys_input.table_id, phys_input.col_id, 0);
+      const auto col_range = getLeafColumnRange(col_var.get(), query_infos, this, false);
+      agg_col_range_cache.setColRange(phys_input, col_range);
+    }
+  }
+  return agg_col_range_cache;
+}
+
+StringDictionaryGenerations Executor::computeStringDictionaryGenerations(
+    const std::unordered_set<PhysicalInput>& phys_inputs) {
+  StringDictionaryGenerations string_dictionary_generations;
+  CHECK(catalog_);
+  for (const auto& phys_input : phys_inputs) {
+    const auto cd =
+        catalog_->getMetadataForColumn(phys_input.table_id, phys_input.col_id);
+    CHECK(cd);
+    const auto& col_ti =
+        cd->columnType.is_array() ? cd->columnType.get_elem_type() : cd->columnType;
+    if (col_ti.is_string() && col_ti.get_compression() == kENCODING_DICT) {
+      const int dict_id = col_ti.get_comp_param();
+      const auto dd = catalog_->getMetadataForDict(dict_id);
+      CHECK(dd && dd->stringDict);
+      string_dictionary_generations.setGeneration(dict_id,
+                                                  dd->stringDict->storageEntryCount());
+    }
+  }
+  return string_dictionary_generations;
+}
+
+TableGenerations Executor::computeTableGenerations(
+    std::unordered_set<int> phys_table_ids) {
+  TableGenerations table_generations;
+  for (const int table_id : phys_table_ids) {
+    const auto table_info = getTableInfo(table_id);
+    table_generations.setGeneration(
+        table_id, TableGeneration{table_info.getPhysicalNumTuples(), 0});
+  }
+  return table_generations;
+}
+
+void Executor::setupCaching(const std::unordered_set<PhysicalInput>& phys_inputs,
+                            const std::unordered_set<int>& phys_table_ids) {
+  CHECK(catalog_);
+  row_set_mem_owner_ = std::make_shared<RowSetMemoryOwner>();
+  agg_col_range_cache_ = computeColRangesCache(phys_inputs);
+  string_dictionary_generations_ = computeStringDictionaryGenerations(phys_inputs);
+  table_generations_ = computeTableGenerations(phys_table_ids);
+}
+
+mapd_shared_mutex& Executor::getSessionLock() {
+  return executor_session_mutex_;
+}
+
+template <>
+void Executor::setCurrentQuerySession(const std::string& query_session,
+                                      mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  if (current_query_session_ == "") {
+    // only set the query session if it currently has an invalid session
+    current_query_session_ = query_session;
+  }
+}
+
+template <>
+std::string& Executor::getCurrentQuerySession(
+    mapd_shared_lock<mapd_shared_mutex>& read_lock) {
+  return current_query_session_;
+}
+
+template <>
+bool Executor::checkCurrentQuerySession(const std::string& candidate_query_session,
+                                        mapd_shared_lock<mapd_shared_mutex>& read_lock) {
+  // if current_query_session is equal to the candidate_query_session,
+  // or it is empty session we consider
+  return (current_query_session_ == candidate_query_session);
+}
+
+template <>
+void Executor::invalidateQuerySession(mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  current_query_session_ = "";
+}
+
+template <>
+bool Executor::addToQuerySessionList(const std::string& query_session,
+                                     mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  return queries_interrupt_flag_.emplace(query_session, false).second;
+}
+
+template <>
+bool Executor::removeFromQuerySessionList(
+    const std::string& query_session,
+    mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  return queries_interrupt_flag_.erase(query_session);
+}
+
+template <>
+void Executor::setQuerySessionAsInterrupted(
+    const std::string& query_session,
+    mapd_unique_lock<mapd_shared_mutex>& write_lock) {
+  queries_interrupt_flag_[query_session] = true;
+}
+
+template <>
+bool Executor::checkIsQuerySessionInterrupted(
+    const std::string& query_session,
+    mapd_shared_lock<mapd_shared_mutex>& read_lock) {
+  auto flag_it = queries_interrupt_flag_.find(query_session);
+  return flag_it != queries_interrupt_flag_.end() && flag_it->second;
+}
+
+void Executor::enableRuntimeQueryInterrupt(const unsigned interrupt_freq) const {
+  // The only one scenario that we intentionally call this function is
+  // to allow runtime query interrupt in QueryRunner for test cases.
+  // Because test machine's default setting does not allow runtime query interrupt,
+  // so we have to turn it on within test code if necessary.
+  g_enable_runtime_query_interrupt = true;
+  g_runtime_query_interrupt_frequency = interrupt_freq;
+}
+
+std::map<int, std::shared_ptr<Executor>> Executor::executors_;
 std::mutex Executor::execute_mutex_;
 mapd_shared_mutex Executor::executors_cache_mutex_;
+std::atomic_flag Executor::execute_spin_lock_ = ATOMIC_FLAG_INIT;
+std::string Executor::current_query_session_{""};
+InterruptFlagMap Executor::queries_interrupt_flag_;
+mapd_shared_mutex Executor::executor_session_mutex_;

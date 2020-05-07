@@ -131,6 +131,7 @@ int64_t QueryExecutionContext::getAggInitValForIndex(const size_t index) const {
 ResultSetPtr QueryExecutionContext::getRowSet(
     const RelAlgExecutionUnit& ra_exe_unit,
     const QueryMemoryDescriptor& query_mem_desc) const {
+  auto timer = DEBUG_TIMER(__func__);
   std::vector<std::pair<ResultSetPtr, std::vector<size_t>>> results_per_sm;
   CHECK(query_buffers_);
   const auto group_by_buffers_size = query_buffers_->getNumBuffers();
@@ -188,10 +189,12 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
     const unsigned block_size_x,
     const unsigned grid_size_x,
     const int device_id,
+    const size_t shared_memory_size,
     int32_t* error_code,
     const uint32_t num_tables,
     const std::vector<int64_t>& join_hash_tables,
     RenderAllocatorMap* render_allocator_map) {
+  auto timer = DEBUG_TIMER(__func__);
   INJECT_TIMER(lauchGpuCode);
 #ifdef HAVE_CUDA
   CHECK(gpu_allocator_);
@@ -220,12 +223,16 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
   cuEventCreate(&start2, 0);
   cuEventCreate(&stop2, 0);
 
-  if (g_enable_dynamic_watchdog) {
+  if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
     cuEventRecord(start0, 0);
   }
 
   if (g_enable_dynamic_watchdog) {
     initializeDynamicWatchdog(cu_functions[device_id].second, device_id);
+  }
+
+  if (g_enable_runtime_query_interrupt) {
+    initializeRuntimeInterrupter(cu_functions[device_id].second, device_id);
   }
 
   auto kernel_params = prepareKernelParams(col_buffers,
@@ -282,7 +289,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
       param_ptrs.push_back(&param);
     }
 
-    if (g_enable_dynamic_watchdog) {
+    if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
       cuEventRecord(stop0, 0);
       cuEventSynchronize(stop0);
       float milliseconds0 = 0;
@@ -294,34 +301,32 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
     }
 
     if (hoist_literals) {
-      checkCudaErrors(
-          cuLaunchKernel(cu_func,
-                         grid_size_x,
-                         grid_size_y,
-                         grid_size_z,
-                         block_size_x,
-                         block_size_y,
-                         block_size_z,
-                         query_mem_desc_.sharedMemBytes(ExecutorDeviceType::GPU),
-                         nullptr,
-                         &param_ptrs[0],
-                         nullptr));
+      checkCudaErrors(cuLaunchKernel(cu_func,
+                                     grid_size_x,
+                                     grid_size_y,
+                                     grid_size_z,
+                                     block_size_x,
+                                     block_size_y,
+                                     block_size_z,
+                                     shared_memory_size,
+                                     nullptr,
+                                     &param_ptrs[0],
+                                     nullptr));
     } else {
       param_ptrs.erase(param_ptrs.begin() + LITERALS);  // TODO(alex): remove
-      checkCudaErrors(
-          cuLaunchKernel(cu_func,
-                         grid_size_x,
-                         grid_size_y,
-                         grid_size_z,
-                         block_size_x,
-                         block_size_y,
-                         block_size_z,
-                         query_mem_desc_.sharedMemBytes(ExecutorDeviceType::GPU),
-                         nullptr,
-                         &param_ptrs[0],
-                         nullptr));
+      checkCudaErrors(cuLaunchKernel(cu_func,
+                                     grid_size_x,
+                                     grid_size_y,
+                                     grid_size_z,
+                                     block_size_x,
+                                     block_size_y,
+                                     block_size_z,
+                                     shared_memory_size,
+                                     nullptr,
+                                     &param_ptrs[0],
+                                     nullptr));
     }
-    if (g_enable_dynamic_watchdog) {
+    if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
       executor_->registerActiveModule(cu_functions[device_id].second, device_id);
       cuEventRecord(stop1, 0);
       cuEventSynchronize(stop1);
@@ -343,7 +348,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
     }
 
     if (!render_allocator) {
-      if (use_streaming_top_n(ra_exe_unit, query_mem_desc_.didOutputColumnar())) {
+      if (query_mem_desc_.useStreamingTopN()) {
         query_buffers_->applyStreamingTopNOffsetGpu(data_mgr,
                                                     query_mem_desc_,
                                                     gpu_group_by_buffers,
@@ -352,11 +357,15 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                                                     device_id);
       } else {
         if (use_speculative_top_n(ra_exe_unit, query_mem_desc_)) {
-          inplace_sort_gpu(ra_exe_unit.sort_info.order_entries,
-                           query_mem_desc_,
-                           gpu_group_by_buffers,
-                           data_mgr,
-                           device_id);
+          try {
+            inplace_sort_gpu(ra_exe_unit.sort_info.order_entries,
+                             query_mem_desc_,
+                             gpu_group_by_buffers,
+                             data_mgr,
+                             device_id);
+          } catch (const std::bad_alloc&) {
+            throw SpeculativeTopNFailed("Failed during in-place GPU sort.");
+          }
         }
         if (query_mem_desc_.getQueryDescriptionType() ==
             QueryDescriptionType::Projection) {
@@ -385,7 +394,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                 ra_exe_unit.use_bump_allocator ? num_allocated_rows
                                                : query_mem_desc_.getEntryCount(),
                 gpu_group_by_buffers,
-                ra_exe_unit,
+                &ra_exe_unit,
                 block_size_x,
                 grid_size_x,
                 device_id,
@@ -403,7 +412,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
               query_mem_desc_,
               query_mem_desc_.getEntryCount(),
               gpu_group_by_buffers,
-              ra_exe_unit,
+              &ra_exe_unit,
               block_size_x,
               grid_size_x,
               device_id,
@@ -414,6 +423,13 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
   } else {
     std::vector<CUdeviceptr> out_vec_dev_buffers;
     const size_t agg_col_count{ra_exe_unit.estimator ? size_t(1) : init_agg_vals.size()};
+    // by default, non-grouped aggregate queries generate one result per available thread
+    // in the lifetime of (potentially multi-fragment) kernel execution.
+    // We can reduce these intermediate results internally in the device and hence have
+    // only one result per device, if GPU shared memory optimizations are enabled.
+    const auto num_results_per_agg_col =
+        shared_memory_size ? 1 : block_size_x * grid_size_x * num_fragments;
+    const auto output_buffer_size_per_agg = num_results_per_agg_col * sizeof(int64_t);
     if (ra_exe_unit.estimator) {
       estimator_result_set_.reset(new ResultSet(
           ra_exe_unit.estimator, ExecutorDeviceType::GPU, device_id, data_mgr));
@@ -422,11 +438,16 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
     } else {
       for (size_t i = 0; i < agg_col_count; ++i) {
         CUdeviceptr out_vec_dev_buffer =
-            num_fragments
-                ? reinterpret_cast<CUdeviceptr>(gpu_allocator_->alloc(
-                      block_size_x * grid_size_x * sizeof(int64_t) * num_fragments))
-                : 0;
+            num_fragments ? reinterpret_cast<CUdeviceptr>(
+                                gpu_allocator_->alloc(output_buffer_size_per_agg))
+                          : 0;
         out_vec_dev_buffers.push_back(out_vec_dev_buffer);
+        if (shared_memory_size) {
+          CHECK_EQ(output_buffer_size_per_agg, size_t(8));
+          gpu_allocator_->copyToDevice(reinterpret_cast<int8_t*>(out_vec_dev_buffer),
+                                       reinterpret_cast<const int8_t*>(&init_agg_vals[i]),
+                                       output_buffer_size_per_agg);
+        }
       }
     }
     auto out_vec_dev_ptr = gpu_allocator_->alloc(agg_col_count * sizeof(CUdeviceptr));
@@ -439,7 +460,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
       param_ptrs.push_back(&param);
     }
 
-    if (g_enable_dynamic_watchdog) {
+    if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
       cuEventRecord(stop0, 0);
       cuEventSynchronize(stop0);
       float milliseconds0 = 0;
@@ -457,7 +478,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                                      block_size_x,
                                      block_size_y,
                                      block_size_z,
-                                     0,
+                                     shared_memory_size,
                                      nullptr,
                                      &param_ptrs[0],
                                      nullptr));
@@ -470,13 +491,13 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                                      block_size_x,
                                      block_size_y,
                                      block_size_z,
-                                     0,
+                                     shared_memory_size,
                                      nullptr,
                                      &param_ptrs[0],
                                      nullptr));
     }
 
-    if (g_enable_dynamic_watchdog) {
+    if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
       executor_->registerActiveModule(cu_functions[device_id].second, device_id);
       cuEventRecord(stop1, 0);
       cuEventSynchronize(stop1);
@@ -504,12 +525,11 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
       return {};
     }
     for (size_t i = 0; i < agg_col_count; ++i) {
-      int64_t* host_out_vec =
-          new int64_t[block_size_x * grid_size_x * sizeof(int64_t) * num_fragments];
+      int64_t* host_out_vec = new int64_t[output_buffer_size_per_agg];
       copy_from_gpu(data_mgr,
                     host_out_vec,
                     out_vec_dev_buffers[i],
-                    block_size_x * grid_size_x * sizeof(int64_t) * num_fragments,
+                    output_buffer_size_per_agg,
                     device_id);
       out_vec.push_back(host_out_vec);
     }
@@ -523,7 +543,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
                   device_id);
   }
 
-  if (g_enable_dynamic_watchdog) {
+  if (g_enable_dynamic_watchdog || g_enable_runtime_query_interrupt) {
     cuEventRecord(stop2, 0);
     cuEventSynchronize(stop2);
     float milliseconds2 = 0;
@@ -550,6 +570,7 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     int32_t* error_code,
     const uint32_t num_tables,
     const std::vector<int64_t>& join_hash_tables) {
+  auto timer = DEBUG_TIMER(__func__);
   INJECT_TIMER(lauchCpuCode);
 
   CHECK(query_buffers_);
@@ -697,7 +718,7 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     *error_code = 0;
   }
 
-  if (use_streaming_top_n(ra_exe_unit, query_mem_desc_.didOutputColumnar())) {
+  if (query_mem_desc_.useStreamingTopN()) {
     query_buffers_->applyStreamingTopNOffsetCpu(query_mem_desc_, ra_exe_unit);
   }
 
@@ -741,7 +762,7 @@ void QueryExecutionContext::initializeDynamicWatchdog(void* native_module,
   CHECK_EQ(dw_sm_cycle_start_size, 128 * sizeof(uint64_t));
   checkCudaErrors(cuMemsetD32(dw_sm_cycle_start, 0, 128 * 2));
 
-  if (!executor_->interrupted_) {
+  if (!executor_->interrupted_.load()) {
     // Executor is not marked as interrupted, make sure dynamic watchdog doesn't block
     // execution
     CUdeviceptr dw_abort;
@@ -758,6 +779,37 @@ void QueryExecutionContext::initializeDynamicWatchdog(void* native_module,
   VLOG(1) << "Device " << std::to_string(device_id)
           << ": launchGpuCode: dynamic watchdog init: " << std::to_string(milliseconds)
           << " ms\n";
+}
+
+void QueryExecutionContext::initializeRuntimeInterrupter(void* native_module,
+                                                         const int device_id) const {
+  if (!executor_->interrupted_.load()) {
+    // Executor is not marked as interrupted, make sure interrupt flag doesn't block
+    // execution
+    auto cu_module = static_cast<CUmodule>(native_module);
+    CHECK(cu_module);
+    CUevent start, stop;
+    cuEventCreate(&start, 0);
+    cuEventCreate(&stop, 0);
+    cuEventRecord(start, 0);
+
+    CUdeviceptr runtime_interrupt_flag;
+    size_t runtime_interrupt_flag_size;
+    checkCudaErrors(cuModuleGetGlobal(&runtime_interrupt_flag,
+                                      &runtime_interrupt_flag_size,
+                                      cu_module,
+                                      "runtime_interrupt_flag"));
+    CHECK_EQ(runtime_interrupt_flag_size, sizeof(uint32_t));
+    checkCudaErrors(cuMemsetD32(runtime_interrupt_flag, 0, 1));
+
+    cuEventRecord(stop, 0);
+    cuEventSynchronize(stop);
+    float milliseconds = 0;
+    cuEventElapsedTime(&milliseconds, start, stop);
+    VLOG(1) << "Device " << std::to_string(device_id)
+            << ": launchGpuCode: runtime query interrupter init: "
+            << std::to_string(milliseconds) << " ms\n";
+  }
 }
 
 std::vector<CUdeviceptr> QueryExecutionContext::prepareKernelParams(

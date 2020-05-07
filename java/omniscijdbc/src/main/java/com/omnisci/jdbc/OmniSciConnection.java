@@ -16,9 +16,9 @@
 package com.omnisci.jdbc;
 
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TServerStatus;
+import com.omnisci.thrift.server.OmniSci;
+import com.omnisci.thrift.server.TOmniSciException;
+import com.omnisci.thrift.server.TServerStatus;
 
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -29,6 +29,11 @@ import org.apache.thrift.transport.TTransportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.*;
+import java.nio.file.Files;
+import java.security.*;
+import java.security.cert.X509Certificate;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.CallableStatement;
@@ -47,6 +52,9 @@ import java.sql.Struct;
 import java.util.*;
 import java.util.concurrent.Executor;
 
+import javax.crypto.Cipher;
+
+import sun.security.provider.X509Factory;
 /**
  *
  * @author michael
@@ -73,15 +81,65 @@ enum Connection_enums {
   port_num,
   db_name,
   protocol,
-  key_store,
-  key_store_pwd,
+  server_trust_store,
+  server_trust_store_pwd,
+  pkiauth,
+  sslcert,
+  sslkey,
+  sslkey_password,
   user,
   user_passwd
 }
 
-public class OmniSciConnection implements java.sql.Connection {
+class KeyLoader {
+  static class S_struct {
+    public String cert;
+    public Key key;
+  }
+
+  public static String getX509(X509Certificate cert) throws Exception {
+    String encoded = Base64.getMimeEncoder().encodeToString(cert.getEncoded());
+    // Note mimeEncoder inserts \r\n in the text - the server is okay with that.
+    encoded = X509Factory.BEGIN_CERT + "\n" + encoded + "\n" + X509Factory.END_CERT;
+    return encoded;
+  }
+
+  public static S_struct getDetails_pkcs12(String filename, String password)
+          throws Exception {
+    S_struct s_struct = new S_struct();
+    try {
+      KeyStore keystore = KeyStore.getInstance("PKCS12");
+      java.io.FileInputStream fis = new java.io.FileInputStream(filename);
+      keystore.load(fis, password.toCharArray());
+      String alias = null;
+      Enumeration<String> eE = keystore.aliases();
+      int count = 0;
+      while (eE.hasMoreElements()) {
+        alias = eE.nextElement();
+        count++;
+      }
+      if (count != 1) {
+        throw new RuntimeException("pkcs12 file [" + filename
+                + "] contains an incorrect number [" + count
+                + "] of certificate(s); only a single certificate is allowed");
+      }
+
+      X509Certificate cert = (X509Certificate) keystore.getCertificate(alias);
+      s_struct.cert = getX509(cert);
+      s_struct.key = keystore.getKey(alias, password.toCharArray());
+    } catch (Exception eX) {
+      OmniSciConnection.logger.error(eX.getMessage());
+      throw eX;
+    }
+    return s_struct;
+  }
+}
+
+public class OmniSciConnection implements java.sql.Connection, Cloneable {
   final static Logger logger = LoggerFactory.getLogger(OmniSciConnection.class);
 
+  Set<String> protocol_set = new HashSet<String>(
+          Arrays.asList("binary", "binary_tls", "http", "https", "https_insecure"));
   // A simple internal class to hold a summary of the properties passed to the
   // connection
   // Properties can come two ways - via the url or via a Properties param
@@ -95,8 +153,15 @@ public class OmniSciConnection implements java.sql.Connection {
                 put(Connection_enums.port_num, new Param_pair("port_num", 3));
                 put(Connection_enums.db_name, new Param_pair("db_name", 4));
                 put(Connection_enums.protocol, new Param_pair("protocol", 5));
-                put(Connection_enums.key_store, new Param_pair("key_store", 6));
-                put(Connection_enums.key_store_pwd, new Param_pair("key_store_pwd", 7));
+                put(Connection_enums.server_trust_store,
+                        new Param_pair("server_trust_store", 6));
+                put(Connection_enums.server_trust_store_pwd,
+                        new Param_pair("server_trust_store_pwd", 7));
+                put(Connection_enums.pkiauth, new Param_pair("pkiauth", 7));
+                put(Connection_enums.sslcert, new Param_pair("sslcert", 8));
+                put(Connection_enums.sslkey, new Param_pair("sslkey", 9));
+                put(Connection_enums.sslkey_password,
+                        new Param_pair("sslkey_password", 10));
                 put(Connection_enums.user, new Param_pair("user", 100));
                 put(Connection_enums.user_passwd, new Param_pair("password", 101));
               }
@@ -153,24 +218,25 @@ public class OmniSciConnection implements java.sql.Connection {
       if (this.containsKey(Connection_enums.protocol)) {
         protocol = (String) this.get(Connection_enums.protocol);
         protocol.toLowerCase();
-        if (!protocol.equals("binary") && !protocol.equals("http")
-                && !protocol.equals("https") && !protocol.equals("https_insecure")) {
+        if (!protocol_set.contains(protocol)) {
           logger.warn("Incorrect protcol [" + protocol
-                  + "] supplied. Possible values are [binary |  http | https | https_insecure]. Using binary as default");
+                  + "] supplied. Possible values are [" + protocol_set.toString()
+                  + "]. Using binary as default");
           protocol = "binary";
           parm_warning = true;
         }
       }
       this.put(Connection_enums.protocol, protocol);
-      if (this.containsKey(Connection_enums.key_store)
-              && !this.containsKey(Connection_enums.key_store_pwd)) {
-        logger.warn("key store [" + (String) this.get(Connection_enums.key_store)
+      if (this.containsKey(Connection_enums.server_trust_store)
+              && !this.containsKey(Connection_enums.server_trust_store_pwd)) {
+        logger.warn("server trust store ["
+                + (String) this.get(Connection_enums.server_trust_store)
                 + " specfied without a password");
         parm_warning = true;
       }
-      if (this.containsKey(Connection_enums.key_store_pwd)
-              && !this.containsKey(Connection_enums.key_store)) {
-        logger.warn("key store password specified without a keystore file");
+      if (this.containsKey(Connection_enums.server_trust_store_pwd)
+              && !this.containsKey(Connection_enums.server_trust_store)) {
+        logger.warn("server trust store password specified without a keystore file");
         parm_warning = true;
       }
     }
@@ -194,114 +260,171 @@ public class OmniSciConnection implements java.sql.Connection {
       return (this.containsKey(Connection_enums.protocol)
               && this.get(Connection_enums.protocol).equals("binary"));
     }
-
+    boolean isBinary_tls() {
+      return (this.containsKey(Connection_enums.protocol)
+              && this.get(Connection_enums.protocol).equals("binary_tls"));
+    }
     boolean containsTrustStore() {
-      return this.containsKey(Connection_enums.key_store);
+      return this.containsKey(Connection_enums.server_trust_store);
     }
   } /*
      * End class Connection_properties extends Hashtable<Connection_enums, Object>
      */
 
   protected String session = null;
-  protected MapD.Client client = null;
+  protected OmniSci.Client client = null;
   protected String catalog;
   protected TTransport transport;
   protected SQLWarning warnings;
   protected String url;
   protected Connection_properties cP = null;
 
+  public OmniSciConnection getAlternateConnection() throws SQLException {
+    // Clones the orignal java connection object, and then reconnects
+    // at the thrift layer - doesn't re-authenticate at the application
+    // level.  Instead reuses the orignal connections session number.
+    logger.debug("OmniSciConnection clone");
+    OmniSciConnection omniSciConnection = null;
+    try {
+      omniSciConnection = (OmniSciConnection) super.clone();
+    } catch (CloneNotSupportedException eE) {
+      throw new SQLException(
+              "Error cloning connection [" + OmniSciExceptionText.getExceptionDetail(eE),
+              eE);
+    }
+    // Now over write the old connection.
+    try {
+      TProtocol protocol = omniSciConnection.manageConnection();
+      omniSciConnection.client = new OmniSci.Client(protocol);
+    } catch (java.lang.Exception jE) {
+      throw new SQLException("Error creating new connection "
+                      + OmniSciExceptionText.getExceptionDetail(jE),
+              jE);
+    }
+    return omniSciConnection;
+  }
+
+  private TProtocol manageConnection() throws java.lang.Exception {
+    SockTransportProperties skT = null;
+    String trust_store = null;
+    if (cP.get(Connection_enums.server_trust_store) != null
+            && !cP.get(Connection_enums.server_trust_store).toString().isEmpty()) {
+      trust_store = cP.get(Connection_enums.server_trust_store).toString();
+    }
+    String trust_store_pwd = null;
+    if (cP.get(Connection_enums.server_trust_store_pwd) != null
+            && !cP.get(Connection_enums.server_trust_store_pwd).toString().isEmpty()) {
+      trust_store_pwd = cP.get(Connection_enums.server_trust_store_pwd).toString();
+    }
+
+    TProtocol protocol = null;
+    if (this.cP.isHttpProtocol()) {
+      // HTTP
+      skT = SockTransportProperties.getUnencryptedClient();
+
+      transport = skT.openHttpClientTransport(
+              (String) this.cP.get(Connection_enums.host_name),
+              ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
+      transport.open();
+      protocol = new TJSONProtocol(transport);
+
+    } else if (this.cP.isBinary()) {
+      skT = SockTransportProperties.getUnencryptedClient();
+      transport =
+              skT.openClientTransport((String) this.cP.get(Connection_enums.host_name),
+                      ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
+      if (!transport.isOpen()) transport.open();
+      protocol = new TBinaryProtocol(transport);
+
+    } else if (this.cP.isHttpsProtocol() || this.cP.isHttpsProtocol_insecure()) {
+      if (trust_store == null) {
+        skT = SockTransportProperties.getEncryptedClientDefaultTrustStore(
+                !this.cP.isHttpsProtocol_insecure());
+      } else {
+        skT = SockTransportProperties.getEncryptedClientSpecifiedTrustStore(
+                trust_store, trust_store_pwd, !this.cP.isHttpsProtocol_insecure());
+      }
+      transport = skT.openHttpsClientTransport(
+              (String) this.cP.get(Connection_enums.host_name),
+              ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
+      transport.open();
+      protocol = new TJSONProtocol(transport);
+
+    } else if (cP.isBinary_tls()) {
+      if (trust_store == null) {
+        skT = SockTransportProperties.getEncryptedClientDefaultTrustStore(false);
+      } else {
+        skT = SockTransportProperties.getEncryptedClientSpecifiedTrustStore(
+                trust_store, trust_store_pwd, false);
+      }
+      transport =
+              skT.openClientTransport((String) this.cP.get(Connection_enums.host_name),
+                      ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
+
+      if (!transport.isOpen()) transport.open();
+      protocol = new TBinaryProtocol(transport);
+    } else {
+      throw new RuntimeException("Invalid protocol supplied");
+    }
+    return protocol;
+  }
+
+  private void setSession(Object pki_auth) throws java.lang.Exception {
+    KeyLoader.S_struct s_struct = null;
+    // If pki aut then stuff public cert into password.
+    if (pki_auth != null && pki_auth.toString().equalsIgnoreCase("true")) {
+      s_struct = KeyLoader.getDetails_pkcs12(
+              this.cP.get(Connection_enums.sslcert).toString(),
+              this.cP.get(Connection_enums.sslkey_password).toString());
+      this.cP.put(Connection_enums.user_passwd, s_struct.cert);
+    }
+
+    // Get the seesion for all connectioms
+    session = client.connect((String) this.cP.get(Connection_enums.user),
+            (String) this.cP.get(Connection_enums.user_passwd),
+            (String) this.cP.get(Connection_enums.db_name));
+
+    // if pki auth the session will be encoded.
+    if (pki_auth != null && pki_auth.toString().equalsIgnoreCase("true")) {
+      Cipher cipher = Cipher.getInstance(s_struct.key.getAlgorithm());
+      cipher.init(Cipher.DECRYPT_MODE, s_struct.key);
+      // session is encrypted and encoded in b64
+      byte[] decodedBytes = Base64.getDecoder().decode(session);
+      byte[] decoded_bytes = cipher.doFinal(decodedBytes);
+      session = new String(decoded_bytes, "UTF-8");
+    }
+  }
+
   public OmniSciConnection(String url, Properties info)
           throws SQLException { // logger.debug("Entered");
     this.url = url;
     this.cP = new Connection_properties(info, url);
-    SockTransportProperties skT = null;
-    String key_store = null;
-    if (cP.get(Connection_enums.key_store) != null
-            && !cP.get(Connection_enums.key_store).toString().isEmpty()) {
-      key_store = cP.get(Connection_enums.key_store).toString();
-    }
-    String key_store_pwd = null;
-    if (cP.get(Connection_enums.key_store_pwd) != null
-            && !cP.get(Connection_enums.key_store_pwd).toString().isEmpty()) {
-      key_store_pwd = cP.get(Connection_enums.key_store_pwd).toString();
-    }
+
     try {
-      // cP extends hashtable. hashtable get returns null when the
-      // key isn't present. If key_store and keys_store_pwd are not present
-      // skT should then load the default java certs file ca-cert.
-      TProtocol protocol = null;
-      if (this.cP.isHttpProtocol()) {
-        // HTTP
-        boolean load_trustinfo = false;
-        skT = new SockTransportProperties(load_trustinfo);
-        transport = skT.openHttpClientTransport(
-                (String) this.cP.get(Connection_enums.host_name),
-                ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
-        transport.open();
-        protocol = new TJSONProtocol(transport);
-      } else if (this.cP.isHttpsProtocol()) {
-        // HTTPS - use CA cert to validate server cert and validate server name
-        skT = new SockTransportProperties(key_store, key_store_pwd);
-        transport = skT.openHttpsClientTransport(
-                (String) this.cP.get(Connection_enums.host_name),
-                ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
-        transport.open();
-        protocol = new TJSONProtocol(transport);
-      } else if (this.cP.isHttpsProtocol_insecure()) {
-        // HTTPS_INSECURE - trust all server names and certs but still encrypt pipe
-        boolean load_trustinfo = false;
-        skT = new SockTransportProperties(load_trustinfo);
-        transport = skT.openHttpsClientTransport(
-                (String) this.cP.get(Connection_enums.host_name),
-                ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
-        transport.open();
-        protocol = new TJSONProtocol(transport);
-      } else if (cP.isBinary()) {
-        // jdbc binary was implmented first. It will currently look for a
-        // specified trust file, but doesn't look
-        // for any of the default java trust stores
-        if (key_store == null || key_store.isEmpty()) {
-          // un encryoted
-          boolean load_trustinfo = false;
-          skT = new SockTransportProperties(load_trustinfo);
-          transport = skT.openClientTransport(
-                  (String) this.cP.get(Connection_enums.host_name),
-                  ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
-        } else {
-          // encryoted
-          skT = new SockTransportProperties(key_store, key_store_pwd);
-          transport = skT.openClientTransportEncrypted(
-                  (String) this.cP.get(Connection_enums.host_name),
-                  ((Integer) this.cP.get(Connection_enums.port_num)).intValue());
-        }
-        if (!transport.isOpen()) transport.open();
-        protocol = new TBinaryProtocol(transport);
-      } else {
-        throw new RuntimeException("Invalid protocol supplied");
-      }
-
-      client = new MapD.Client(protocol);
-      session = client.connect((String) this.cP.get(Connection_enums.user),
-              (String) this.cP.get(Connection_enums.user_passwd),
-              (String) this.cP.get(Connection_enums.db_name));
-
+      TProtocol protocol = manageConnection();
+      client = new OmniSci.Client(protocol);
+      setSession(this.cP.get(Connection_enums.pkiauth));
       catalog = (String) this.cP.get(Connection_enums.db_name);
-      logger.debug("Connected session is " + session);
-
     } catch (TTransportException ex) {
-      throw new SQLException("Connection failed - " + ex.toString());
-    } catch (TMapDException ex) {
-      throw new SQLException("Connection failed - " + ex.toString());
+      throw new SQLException("Thrift transport connection failed - "
+                      + OmniSciExceptionText.getExceptionDetail(ex),
+              ex);
+    } catch (TOmniSciException ex) {
+      throw new SQLException("Omnisci connection failed - "
+                      + OmniSciExceptionText.getExceptionDetail(ex),
+              ex);
     } catch (TException ex) {
-      throw new SQLException("Connection failed - " + ex.toString());
+      throw new SQLException(
+              "Thrift failed - " + OmniSciExceptionText.getExceptionDetail(ex), ex);
     } catch (java.lang.Exception ex) {
-      throw new SQLException("Connection failed - " + ex.toString());
+      throw new SQLException(
+              "Connection failed - " + OmniSciExceptionText.getExceptionDetail(ex), ex);
     }
   }
 
   @Override
   public Statement createStatement() throws SQLException { // logger.debug("Entered");
-    return new OmniSciStatement(session, client);
+    return new OmniSciStatement(session, this);
   }
 
   @Override
@@ -358,13 +481,18 @@ public class OmniSciConnection implements java.sql.Connection {
       if (session != null) {
         client.disconnect(session);
       }
-      session = null;
-      transport.close();
-    } catch (TMapDException ex) {
+      closeConnection();
+    } catch (TOmniSciException ex) {
       throw new SQLException("disconnect failed." + ex.toString());
     } catch (TException ex) {
       throw new SQLException("disconnect failed." + ex.toString());
     }
+  }
+
+  // needs to be accessed by other classes with in the package
+  protected void closeConnection() throws SQLException { // logger.debug("Entered");
+    session = null;
+    transport.close();
   }
 
   @Override
@@ -396,7 +524,7 @@ public class OmniSciConnection implements java.sql.Connection {
         TServerStatus server_status = client.get_server_status(session);
         return server_status.read_only;
       }
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       throw new SQLException(
               "get_server_status failed during isReadOnly check." + ex.toString());
     } catch (TException ex) {
@@ -443,7 +571,7 @@ public class OmniSciConnection implements java.sql.Connection {
   @Override
   public Statement createStatement(int resultSetType, int resultSetConcurrency)
           throws SQLException { // logger.debug("Entered");
-    return new OmniSciStatement(session, client);
+    return new OmniSciStatement(session, this);
   }
 
   @Override
@@ -630,7 +758,7 @@ public class OmniSciConnection implements java.sql.Connection {
       client.get_server_status(session);
     } catch (TTransportException ex) {
       throw new SQLException("Connection failed - " + ex.toString());
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       throw new SQLException("Connection failed - " + ex.toString());
     } catch (TException ex) {
       throw new SQLException("Connection failed - " + ex.toString());
@@ -691,10 +819,20 @@ public class OmniSciConnection implements java.sql.Connection {
 
   @Override
   public void setSchema(String schema) throws SQLException { // logger.debug("Entered");
-    throw new UnsupportedOperationException("Not supported yet,"
-            + " line:" + new Throwable().getStackTrace()[0].getLineNumber()
-            + " class:" + new Throwable().getStackTrace()[0].getClassName()
-            + " method:" + new Throwable().getStackTrace()[0].getMethodName());
+    // Setting setSchema to be a NOOP allows integration with third party products
+    // that require a successful call to setSchema to work.
+    Object db_name = this.cP.get(Connection_enums.db_name);
+    if (db_name == null) {
+      throw new RuntimeException("db name not set, "
+              + " line:" + new Throwable().getStackTrace()[0].getLineNumber()
+              + " class:" + new Throwable().getStackTrace()[0].getClassName()
+              + " method:" + new Throwable().getStackTrace()[0].getMethodName());
+    }
+    if (!schema.equals(db_name.toString())) {
+      logger.warn("Connected to schema [" + schema + "] differs from db name [" + db_name
+              + "].");
+    }
+    return;
   }
 
   @Override

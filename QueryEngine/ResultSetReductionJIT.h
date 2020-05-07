@@ -18,6 +18,7 @@
 
 #include "CgenState.h"
 #include "CodeCache.h"
+#include "ResultSetReductionOps.h"
 
 #include "Descriptors/QueryMemoryDescriptor.h"
 #include "Shared/TargetInfo.h"
@@ -27,19 +28,6 @@
 #include <llvm/IR/Value.h>
 
 struct ReductionCode {
-  ReductionCode(ReductionCode&&) = default;
-
-  ~ReductionCode() {
-    // We only need to worry about races for the interpreter, which owns the execution
-    // engine and has a null native function pointer.
-    if (own_execution_engine.get() && !func_ptr) {
-      std::lock_guard<std::mutex> reduction_guard(ReductionCode::s_reduction_mutex);
-      cgen_state = nullptr;
-      module = nullptr;
-      own_execution_engine = ExecutionEngineWrapper();
-    }
-  }
-
   // Function which reduces 'that_buff' into 'this_buff', for rows between
   // [start_entry_index, end_entry_index).
   using FuncPtr = int32_t (*)(int8_t* this_buff,
@@ -51,15 +39,14 @@ struct ReductionCode {
                               const void* that_qmd,
                               const void* serialized_varlen_buffer);
 
-  std::unique_ptr<CgenState> cgen_state;
-  llvm::ExecutionEngine* execution_engine;
-  ExecutionEngineWrapper own_execution_engine;
-  std::unique_ptr<llvm::Module> module;
-  llvm::Function* ir_is_empty;
-  llvm::Function* ir_reduce_one_entry;
-  llvm::Function* ir_reduce_one_entry_idx;
-  llvm::Function* ir_reduce_loop;
   FuncPtr func_ptr;
+  llvm::Function* llvm_reduce_loop;
+  std::unique_ptr<CgenState> cgen_state;
+  std::unique_ptr<llvm::Module> module;
+  std::unique_ptr<Function> ir_is_empty;
+  std::unique_ptr<Function> ir_reduce_one_entry;
+  std::unique_ptr<Function> ir_reduce_one_entry_idx;
+  std::unique_ptr<Function> ir_reduce_loop;
 
   static std::mutex s_reduction_mutex;
 };
@@ -71,11 +58,10 @@ class ResultSetReductionJIT {
                         const std::vector<int64_t>& target_init_vals);
 
   // Generate the code for the result set reduction loop.
-  ReductionCode codegen() const;
-
+  virtual ReductionCode codegen() const;
   static void clearCache();
 
- private:
+ protected:
   // Generate a function which checks whether a row is empty.
   void isEmpty(const ReductionCode& reduction_code) const;
 
@@ -83,61 +69,94 @@ class ResultSetReductionJIT {
   // perfect hash layout.
   void reduceOneEntryNoCollisions(const ReductionCode& reduction_code) const;
 
-  // Used to implement 'reduceOneEntryNoCollisions'.
-  void reduceOneEntryTargetsNoCollisions(const ReductionCode& reduction_code,
-                                         llvm::Value* this_targets_start_ptr,
-                                         llvm::Value* that_targets_start_ptr) const;
-
-  // Same as above, for the baseline layout.
-  void reduceOneEntryBaseline(const ReductionCode& reduction_code) const;
-
   // Generate a function which reduces two rows given by the start pointer of the result
   // buffers they are part of and the indices inside those buffers.
   void reduceOneEntryNoCollisionsIdx(const ReductionCode& reduction_code) const;
 
-  // Same as above, for the baseline layout.
-  void reduceOneEntryBaselineIdx(const ReductionCode& reduction_code) const;
-
   // Generate a function for the reduction of an entire result set chunk.
   void reduceLoop(const ReductionCode& reduction_code) const;
 
+ private:
+  // Used to implement 'reduceOneEntryNoCollisions'.
+  void reduceOneEntryTargetsNoCollisions(Function* ir_reduce_one_entry,
+                                         Value* this_targets_start_ptr,
+                                         Value* that_targets_start_ptr) const;
+
+  // Same as above, for the baseline layout.
+  void reduceOneEntryBaseline(const ReductionCode& reduction_code) const;
+
+  // Same as above, for the baseline layout.
+  void reduceOneEntryBaselineIdx(const ReductionCode& reduction_code) const;
+
   // Generate reduction code for a single slot.
-  void reduceOneSlot(llvm::Value* this_ptr1,
-                     llvm::Value* this_ptr2,
-                     llvm::Value* that_ptr1,
-                     llvm::Value* that_ptr2,
+  void reduceOneSlot(Value* this_ptr1,
+                     Value* this_ptr2,
+                     Value* that_ptr1,
+                     Value* that_ptr2,
                      const TargetInfo& target_info,
                      const size_t target_logical_idx,
                      const size_t target_slot_idx,
                      const size_t init_agg_val_idx,
                      const size_t first_slot_idx_for_target,
-                     const ReductionCode& reduction_code) const;
+                     Function* ir_reduce_one_entry) const;
 
   // Generate reduction code for a single aggregate (with the exception of sample) slot.
-  void reduceOneAggregateSlot(llvm::Value* this_ptr1,
-                              llvm::Value* this_ptr2,
-                              llvm::Value* that_ptr1,
-                              llvm::Value* that_ptr2,
+  void reduceOneAggregateSlot(Value* this_ptr1,
+                              Value* this_ptr2,
+                              Value* that_ptr1,
+                              Value* that_ptr2,
                               const TargetInfo& target_info,
                               const size_t target_logical_idx,
                               const size_t target_slot_idx,
                               const int64_t init_val,
                               const int8_t chosen_bytes,
-                              const ReductionCode& reduction_code) const;
+                              Function* ir_reduce_one_entry) const;
 
   // Generate reduction code for a count distinct slot.
-  void reduceOneCountDistinctSlot(llvm::Value* this_ptr1,
-                                  llvm::Value* that_ptr1,
+  void reduceOneCountDistinctSlot(Value* this_ptr1,
+                                  Value* that_ptr1,
                                   const size_t target_logical_idx,
-                                  const ReductionCode& reduction_code) const;
+                                  Function* ir_reduce_one_entry) const;
 
-  ReductionCode finalizeReductionCode(ReductionCode reduction_code) const;
+  ReductionCode finalizeReductionCode(ReductionCode reduction_code,
+                                      const llvm::Function* ir_is_empty,
+                                      const llvm::Function* ir_reduce_one_entry,
+                                      const llvm::Function* ir_reduce_one_entry_idx,
+                                      const CodeCacheKey& key) const;
 
-  // Returns true iff we will (should and is possible to) use the LLVM interpreter.
-  bool useInterpreter(const CgenState* cgen_state) const;
+  std::string cacheKey() const;
 
   const QueryMemoryDescriptor query_mem_desc_;
   const std::vector<TargetInfo> targets_;
   const std::vector<int64_t> target_init_vals_;
   static CodeCache s_code_cache;
+};
+
+/**
+ * This is a helper class for performing GPU reduction code.
+ * It uses the same functions that ResultSetReductionJIT generates so that
+ * it can be reused and help the reduction procedure within GPU.
+ */
+class GpuReductionHelperJIT : public ResultSetReductionJIT {
+ public:
+  GpuReductionHelperJIT(const QueryMemoryDescriptor& query_mem_desc,
+                        const std::vector<TargetInfo>& targets,
+                        const std::vector<int64_t>& target_init_vals)
+      : ResultSetReductionJIT(query_mem_desc, targets, target_init_vals)
+      , query_mem_desc_(query_mem_desc) {
+    CHECK(query_mem_desc_.getQueryDescriptionType() ==
+          QueryDescriptionType::GroupByPerfectHash);
+    CHECK(!query_mem_desc_.didOutputColumnar());
+    CHECK(query_mem_desc_.hasKeylessHash());
+  }
+  /**
+   * generates code for perfect hash group by reduction: the following functions are
+   * internally created: isEmpty, reduceOneEntryNoCollision (reduce for perfect hash),
+   * reduceOneEntryNoCollissionsIdx(reduce one slot for perfect hash), and reduceLoop (the
+   * outer loop).
+   */
+  virtual ReductionCode codegen() const;
+
+ private:
+  const QueryMemoryDescriptor& query_mem_desc_;
 };

@@ -47,7 +47,7 @@ import org.apache.calcite.rex.RexOver;
 import org.apache.calcite.rex.RexSubQuery;
 import org.apache.calcite.rex.RexWindow;
 import org.apache.calcite.rex.RexWindowBound;
-import org.apache.calcite.sql.SemiJoinType;
+import org.apache.calcite.sql.JoinType;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlOperator;
@@ -66,8 +66,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Utilities for converting {@link org.apache.calcite.rel.RelNode}
- * into JSON format.
+ * Utilities for converting {@link org.apache.calcite.rel.RelNode} into JSON
+ * format.
  */
 public class MapDRelJson {
   private final Map<String, Constructor> constructorMap =
@@ -262,7 +262,7 @@ public class MapDRelJson {
       return toJson((RelDataType) value);
     } else if (value instanceof RelDataTypeField) {
       return toJson((RelDataTypeField) value);
-    } else if (value instanceof SemiJoinType) {
+    } else if (value instanceof JoinType) {
       return value.toString();
     } else if (value instanceof Operation) {
       return value.toString();
@@ -331,11 +331,7 @@ public class MapDRelJson {
         if (value2 instanceof TimeUnitRange) {
           map.put("literal", value2.toString());
         } else {
-          if (value2 instanceof String) {
-            map.put("literal", ((String) value2).replace("\\", "\\\\"));
-          } else {
-            map.put("literal", value2);
-          }
+          map.put("literal", value2);
         }
         map.put("type", literal.getTypeName().name());
         map.put("target_type", literal.getType().getSqlTypeName().toString());

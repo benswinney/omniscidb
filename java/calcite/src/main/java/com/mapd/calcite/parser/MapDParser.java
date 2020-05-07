@@ -15,40 +15,61 @@
  */
 package com.mapd.calcite.parser;
 
+import static org.apache.calcite.sql.parser.SqlParserPos.ZERO;
+
 import com.google.common.collect.ImmutableList;
 import com.mapd.common.SockTransportProperties;
+import com.mapd.parser.extension.ddl.ExtendedSqlParser;
+import com.mapd.parser.extension.ddl.JsonSerializableDdl;
 import com.mapd.parser.server.ExtensionFunction;
 
 import org.apache.calcite.avatica.util.Casing;
 import org.apache.calcite.config.CalciteConnectionConfig;
 import org.apache.calcite.config.CalciteConnectionConfigImpl;
+import org.apache.calcite.config.CalciteConnectionProperty;
 import org.apache.calcite.plan.Context;
 import org.apache.calcite.plan.RelOptLattice;
 import org.apache.calcite.plan.RelOptMaterialization;
+import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.prepare.MapDPlanner;
 import org.apache.calcite.prepare.SqlIdentifierCapturer;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.RelShuttleImpl;
+import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.RelFactories;
+import org.apache.calcite.rel.core.TableModify;
+import org.apache.calcite.rel.core.TableModify.Operation;
+import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.logical.LogicalTableModify;
 import org.apache.calcite.rel.metadata.DefaultRelMetadataProvider;
 import org.apache.calcite.rel.rules.FilterMergeRule;
 import org.apache.calcite.rel.rules.FilterProjectTransposeRule;
 import org.apache.calcite.rel.rules.JoinProjectTransposeRule;
 import org.apache.calcite.rel.rules.ProjectMergeRule;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexShuttle;
+import org.apache.calcite.runtime.CalciteException;
 import org.apache.calcite.schema.SchemaPlus;
-import org.apache.calcite.sql.SqlAsOperator;
+import org.apache.calcite.sql.JoinConditionType;
+import org.apache.calcite.sql.JoinType;
 import org.apache.calcite.sql.SqlBasicCall;
+import org.apache.calcite.sql.SqlBasicTypeNameSpec;
 import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlDataTypeSpec;
+import org.apache.calcite.sql.SqlDelete;
 import org.apache.calcite.sql.SqlDialect;
+import org.apache.calcite.sql.SqlFunctionCategory;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlJoin;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
@@ -57,12 +78,16 @@ import org.apache.calcite.sql.SqlNumericLiteral;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.SqlOrderBy;
 import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.SqlUnresolvedFunction;
+import org.apache.calcite.sql.SqlUpdate;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
+import org.apache.calcite.sql.util.SqlBasicVisitor;
+import org.apache.calcite.sql.util.SqlShuttle;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
 import org.apache.calcite.tools.FrameworkConfig;
@@ -73,14 +98,22 @@ import org.apache.calcite.tools.Programs;
 import org.apache.calcite.tools.RelConversionException;
 import org.apache.calcite.tools.ValidationException;
 import org.apache.calcite.util.ConversionUtil;
+import org.apache.calcite.util.Util;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiPredicate;
 
 /**
  *
@@ -88,6 +121,14 @@ import java.util.Set;
  */
 public final class MapDParser {
   public static final ThreadLocal<MapDParser> CURRENT_PARSER = new ThreadLocal<>();
+  private static final EnumSet<SqlKind> SCALAR =
+          EnumSet.of(SqlKind.SCALAR_QUERY, SqlKind.SELECT);
+  private static final EnumSet<SqlKind> EXISTS = EnumSet.of(SqlKind.EXISTS);
+  private static final EnumSet<SqlKind> DELETE = EnumSet.of(SqlKind.DELETE);
+  private static final EnumSet<SqlKind> UPDATE = EnumSet.of(SqlKind.UPDATE);
+  private static final EnumSet<SqlKind> IN = EnumSet.of(SqlKind.IN);
+  private static final EnumSet<SqlKind> ARRAY_VALUE =
+          EnumSet.of(SqlKind.ARRAY_VALUE_CONSTRUCTOR);
 
   final static Logger MAPDLOGGER = LoggerFactory.getLogger(MapDParser.class);
 
@@ -103,6 +144,8 @@ public final class MapDParser {
   private MapDUser mapdUser;
   SqlNode sqlNode_;
   private SockTransportProperties sock_transport_properties = null;
+
+  private static Map<String, Boolean> SubqueryCorrMemo = new ConcurrentHashMap<>();
 
   public MapDParser(String dataDir,
           final Map<String, ExtensionFunction> extSigs,
@@ -120,9 +163,20 @@ public final class MapDParser {
     this.sock_transport_properties = skT;
   }
 
+  public void clearMemo() {
+    SubqueryCorrMemo.clear();
+  }
+
   private static final Context MAPD_CONNECTION_CONTEXT = new Context() {
-    MapDRelDataTypeSystemImpl myTypeSystem = new MapDRelDataTypeSystemImpl();
+    MapDTypeSystem myTypeSystem = new MapDTypeSystem();
     CalciteConnectionConfig config = new CalciteConnectionConfigImpl(new Properties()) {
+      {
+        properties.put(CalciteConnectionProperty.CASE_SENSITIVE.camelName(),
+                String.valueOf(false));
+        properties.put(CalciteConnectionProperty.CONFORMANCE.camelName(),
+                String.valueOf(SqlConformanceEnum.LENIENT));
+      }
+
       @SuppressWarnings("unchecked")
       public <T extends Object> T typeSystem(
               java.lang.Class<T> typeSystemClass, T defaultTypeSystem) {
@@ -148,9 +202,135 @@ public final class MapDParser {
   };
 
   private MapDPlanner getPlanner() {
-    MapDSchema mapd =
+    return getPlanner(true, true);
+  }
+
+  private boolean isCorrelated(SqlNode expression) {
+    String queryString = expression.toSqlString(SqlDialect.CALCITE).getSql();
+    Boolean isCorrelatedSubquery = SubqueryCorrMemo.get(queryString);
+    if (null != isCorrelatedSubquery) {
+      return isCorrelatedSubquery;
+    }
+
+    try {
+      MapDParser parser =
+              new MapDParser(dataDir, extSigs, mapdPort, sock_transport_properties);
+      MapDParserOptions options = new MapDParserOptions();
+      parser.setUser(mapdUser);
+      parser.processSql(expression.toSqlString(SqlDialect.CALCITE).getSql(), options);
+    } catch (Exception e) {
+      // if we are not able to parse, then assume correlated
+      SubqueryCorrMemo.put(queryString, true);
+      return true;
+    }
+    SubqueryCorrMemo.put(queryString, false);
+    return false;
+  }
+
+  private MapDPlanner getPlanner(final boolean allowSubQueryExpansion,
+          final boolean allowPushdownJoinCondition) {
+    final MapDSchema mapd =
             new MapDSchema(dataDir, this, mapdPort, mapdUser, sock_transport_properties);
     final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+
+    BiPredicate<SqlNode, SqlNode> expandPredicate = new BiPredicate<SqlNode, SqlNode>() {
+      @Override
+      public boolean test(SqlNode root, SqlNode expression) {
+        if (!allowSubQueryExpansion) {
+          return false;
+        }
+
+        // special handling of sub-queries
+        if (expression.isA(SCALAR) || expression.isA(EXISTS) || expression.isA(IN)) {
+          // only expand if it is correlated.
+
+          if (expression.isA(EXISTS)) {
+            // always expand subquery by EXISTS clause
+            return true;
+          }
+
+          if (expression.isA(IN)) {
+            // expand subquery by IN clause
+            // but correlated subquery by NOT_IN clause is not available
+            // currently due to a lack of supporting in Calcite
+            boolean found_expression = false;
+            if (expression instanceof SqlCall) {
+              SqlCall call = (SqlCall) expression;
+              if (call.getOperandList().size() == 2) {
+                // if IN clause is correlated, its second operand of corresponding
+                // expression is SELECT clause which indicates a correlated subquery.
+                // Here, an expression "f.val IN (SELECT ...)" has two operands.
+                // Since we have interest in its subquery, so try to check whether
+                // the second operand, i.e., call.getOperandList().get(1)
+                // is a type of SqlSelect and also is correlated.
+                // Note that the second operand of non-correlated IN clause
+                // does not have SqlSelect as its second operand
+                if (call.getOperandList().get(1) instanceof SqlSelect) {
+                  expression = call.getOperandList().get(1);
+                  SqlSelect select_call = (SqlSelect) expression;
+                  if (select_call.hasWhere()) {
+                    found_expression = true;
+                  }
+                }
+              }
+            }
+            if (!found_expression) {
+              return false;
+            }
+          }
+
+          if (isCorrelated(expression)) {
+            SqlSelect select = null;
+            if (expression instanceof SqlCall) {
+              SqlCall call = (SqlCall) expression;
+              if (call.getOperator().equals(SqlStdOperatorTable.SCALAR_QUERY)) {
+                expression = call.getOperandList().get(0);
+              }
+            }
+
+            if (expression instanceof SqlSelect) {
+              select = (SqlSelect) expression;
+            }
+
+            if (null != select) {
+              if (null != select.getFetch() || null != select.getOffset()
+                      || (null != select.getOrderList()
+                              && select.getOrderList().size() != 0)) {
+                throw new CalciteException(
+                        "Correlated sub-queries with ordering not supported.", null);
+              }
+            }
+            return true;
+          }
+        }
+
+        // per default we do not want to expand
+        return false;
+      }
+    };
+
+    BiPredicate<SqlNode, Join> pushdownJoinPredicate = new BiPredicate<SqlNode, Join>() {
+      @Override
+      public boolean test(SqlNode t, Join u) {
+        if (!allowPushdownJoinCondition) {
+          return false;
+        }
+
+        return !hasGeoColumns(u.getRowType());
+      }
+
+      private boolean hasGeoColumns(RelDataType type) {
+        for (RelDataTypeField f : type.getFieldList()) {
+          if ("any".equalsIgnoreCase(f.getType().getFamily().toString())) {
+            // any indicates geo types at the moment
+            return true;
+          }
+        }
+
+        return false;
+      }
+    };
+
     final FrameworkConfig config =
             Frameworks.newConfigBuilder()
                     .defaultSchema(rootSchema.add(mapdUser.getDB(), mapd))
@@ -159,14 +339,18 @@ public final class MapDParser {
                                           .setConformance(SqlConformanceEnum.LENIENT)
                                           .setUnquotedCasing(Casing.UNCHANGED)
                                           .setCaseSensitive(false)
+                                          // allow identifiers of up to 512 chars
+                                          .setIdentifierMaxLength(512)
+                                          .setParserFactory(ExtendedSqlParser.FACTORY)
                                           .build())
                     .sqlToRelConverterConfig(
                             SqlToRelConverter
                                     .configBuilder()
-                                    // disable sub-query expansion (in-lining)
-                                    .withExpand(false)
+                                    // enable sub-query expansion (de-correlation)
+                                    .withExpandPredicate(expandPredicate)
                                     // allow as many as possible IN operator values
                                     .withInSubQueryThreshold(Integer.MAX_VALUE)
+                                    .withPushdownJoinCondition(pushdownJoinPredicate)
                                     .build())
                     .typeSystem(createTypeSystem())
                     .context(MAPD_CONNECTION_CONTEXT)
@@ -178,12 +362,18 @@ public final class MapDParser {
     this.mapdUser = mapdUser;
   }
 
-  public String getRelAlgebra(
-          String sql, final MapDParserOptions parserOptions, final MapDUser mapDUser)
+  public String processSql(String sql, final MapDParserOptions parserOptions)
           throws SqlParseException, ValidationException, RelConversionException {
     callCount++;
-    final RelRoot sqlRel = queryToSqlNode(sql, parserOptions);
 
+    final MapDPlanner planner = getPlanner(true, true);
+    final SqlNode sqlNode = parseSql(sql, parserOptions.isLegacySyntax(), planner);
+
+    if (sqlNode instanceof JsonSerializableDdl) {
+      return ((JsonSerializableDdl) sqlNode).toJsonString();
+    }
+
+    final RelRoot sqlRel = convertSqlToRelNode(sql, sqlNode, planner, parserOptions);
     RelNode project = sqlRel.project();
 
     if (parserOptions.isExplain()) {
@@ -222,51 +412,354 @@ public final class MapDParser {
     return resolved;
   }
 
-  RelRoot queryToSqlNode(final String sql, final MapDParserOptions parserOptions)
-          throws SqlParseException, ValidationException, RelConversionException {
-    MapDPlanner planner = getPlanner();
+  private String getTableName(SqlNode node) {
+    if (node.isA(EnumSet.of(SqlKind.AS))) {
+      node = ((SqlCall) node).getOperandList().get(1);
+    }
+    if (node instanceof SqlIdentifier) {
+      SqlIdentifier id = (SqlIdentifier) node;
+      return id.names.get(id.names.size() - 1);
+    }
+    return null;
+  }
 
-    SqlNode node = processSQL(sql, parserOptions.isLegacySyntax(), planner);
+  private SqlSelect rewriteSimpleUpdateAsSelect(final SqlUpdate update) {
+    SqlNode where = update.getCondition();
+
+    if (update.getSourceExpressionList().size() != 1) {
+      return null;
+    }
+
+    if (!(update.getSourceExpressionList().get(0) instanceof SqlSelect)) {
+      return null;
+    }
+
+    final SqlSelect inner = (SqlSelect) update.getSourceExpressionList().get(0);
+
+    if (null != inner.getGroup() || null != inner.getFetch() || null != inner.getOffset()
+            || (null != inner.getOrderList() && inner.getOrderList().size() != 0)
+            || (null != inner.getGroup() && inner.getGroup().size() != 0)
+            || null == getTableName(inner.getFrom())) {
+      return null;
+    }
+
+    if (!isCorrelated(inner)) {
+      return null;
+    }
+
+    final String updateTableName = getTableName(update.getTargetTable());
+
+    if (null != where) {
+      where = where.accept(new SqlShuttle() {
+        @Override
+        public SqlNode visit(SqlIdentifier id) {
+          if (id.isSimple()) {
+            id = new SqlIdentifier(Arrays.asList(updateTableName, id.getSimple()),
+                    id.getParserPosition());
+          }
+
+          return id;
+        }
+      });
+    }
+
+    SqlJoin join = new SqlJoin(ZERO,
+            update.getTargetTable(),
+            SqlLiteral.createBoolean(false, ZERO),
+            SqlLiteral.createSymbol(JoinType.LEFT, ZERO),
+            inner.getFrom(),
+            SqlLiteral.createSymbol(JoinConditionType.ON, ZERO),
+            inner.getWhere());
+
+    SqlNode select0 = inner.getSelectList().get(0);
+
+    boolean wrapInSingleValue = true;
+    if (select0 instanceof SqlCall) {
+      SqlCall selectExprCall = (SqlCall) select0;
+      if (Util.isSingleValue(selectExprCall)) {
+        wrapInSingleValue = false;
+      }
+    }
+
+    if (wrapInSingleValue) {
+      select0 = new SqlBasicCall(
+              SqlStdOperatorTable.SINGLE_VALUE, new SqlNode[] {select0}, ZERO);
+    }
+
+    SqlNodeList selectList = new SqlNodeList(ZERO);
+    selectList.add(select0);
+    selectList.add(new SqlBasicCall(SqlStdOperatorTable.AS,
+            new SqlNode[] {new SqlBasicCall(
+                                   new SqlUnresolvedFunction(
+                                           new SqlIdentifier("OFFSET_IN_FRAGMENT", ZERO),
+                                           null,
+                                           null,
+                                           null,
+                                           null,
+                                           SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                                   new SqlNode[0],
+                                   SqlParserPos.ZERO),
+                    new SqlIdentifier("EXPR$DELETE_OFFSET_IN_FRAGMENT", ZERO)},
+            ZERO));
+
+    SqlNodeList groupBy = new SqlNodeList(ZERO);
+    groupBy.add(new SqlIdentifier("EXPR$DELETE_OFFSET_IN_FRAGMENT", ZERO));
+
+    SqlSelect select = new SqlSelect(ZERO,
+            null,
+            selectList,
+            join,
+            where,
+            groupBy,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null);
+    return select;
+  }
+
+  private LogicalTableModify getDummyUpdate(SqlUpdate update)
+          throws SqlParseException, ValidationException, RelConversionException {
+    SqlIdentifier targetTable = (SqlIdentifier) update.getTargetTable();
+    String targetTableName = targetTable.names.get(targetTable.names.size() - 1);
+    MapDPlanner planner = getPlanner();
+    String dummySql = "DELETE FROM " + targetTableName;
+    SqlNode dummyNode = planner.parse(dummySql);
+    dummyNode = planner.validate(dummyNode);
+    RelRoot dummyRoot = planner.rel(dummyNode);
+    LogicalTableModify dummyModify = (LogicalTableModify) dummyRoot.rel;
+    return dummyModify;
+  }
+
+  private RelRoot rewriteUpdateAsSelect(SqlUpdate update, MapDParserOptions parserOptions)
+          throws SqlParseException, ValidationException, RelConversionException {
+    int correlatedQueriesCount[] = new int[1];
+    SqlBasicVisitor<Void> correlatedQueriesCounter = new SqlBasicVisitor<Void>() {
+      @Override
+      public Void visit(SqlCall call) {
+        if (call.isA(SCALAR)
+                && ((call instanceof SqlBasicCall && call.operandCount() == 1
+                            && !call.operand(0).isA(SCALAR))
+                        || !(call instanceof SqlBasicCall))) {
+          if (isCorrelated(call)) {
+            correlatedQueriesCount[0]++;
+          }
+        }
+        return super.visit(call);
+      }
+    };
+
+    update.accept(correlatedQueriesCounter);
+    if (correlatedQueriesCount[0] > 1) {
+      throw new CalciteException(
+              "table modifications with multiple correlated sub-queries not supported.",
+              null);
+    }
+
+    boolean allowPushdownJoinCondition = false;
+    SqlNodeList sourceExpression = new SqlNodeList(SqlParserPos.ZERO);
+    LogicalTableModify dummyModify = getDummyUpdate(update);
+    RelOptTable targetTable = dummyModify.getTable();
+    RelDataType targetTableType = targetTable.getRowType();
+
+    SqlSelect select = rewriteSimpleUpdateAsSelect(update);
+    boolean applyRexCast = null == select;
+
+    if (null == select) {
+      for (int i = 0; i < update.getSourceExpressionList().size(); i++) {
+        SqlNode targetColumn = update.getTargetColumnList().get(i);
+        SqlNode expression = update.getSourceExpressionList().get(i);
+
+        if (!(targetColumn instanceof SqlIdentifier)) {
+          throw new RuntimeException("Unknown identifier type!");
+        }
+        SqlIdentifier id = (SqlIdentifier) targetColumn;
+        RelDataType fieldType =
+                targetTableType.getField(id.names.get(id.names.size() - 1), false, false)
+                        .getType();
+
+        if (expression.isA(ARRAY_VALUE) && null != fieldType.getComponentType()) {
+          // apply a cast to all array value elements
+
+          SqlDataTypeSpec elementType = new SqlDataTypeSpec(
+                  new SqlBasicTypeNameSpec(fieldType.getComponentType().getSqlTypeName(),
+                          fieldType.getPrecision(),
+                          fieldType.getScale(),
+                          null == fieldType.getCharset() ? null
+                                                         : fieldType.getCharset().name(),
+                          SqlParserPos.ZERO),
+                  SqlParserPos.ZERO);
+          SqlCall array_expression = (SqlCall) expression;
+          ArrayList<SqlNode> values = new ArrayList<>();
+
+          for (SqlNode value : array_expression.getOperandList()) {
+            if (value.isA(EnumSet.of(SqlKind.LITERAL))) {
+              SqlNode casted_value = new SqlBasicCall(SqlStdOperatorTable.CAST,
+                      new SqlNode[] {value, elementType},
+                      value.getParserPosition());
+              values.add(casted_value);
+            } else {
+              values.add(value);
+            }
+          }
+
+          expression = new SqlBasicCall(MapDSqlOperatorTable.ARRAY_VALUE_CONSTRUCTOR,
+                  values.toArray(new SqlNode[0]),
+                  expression.getParserPosition());
+        }
+        sourceExpression.add(expression);
+      }
+
+      sourceExpression.add(new SqlBasicCall(SqlStdOperatorTable.AS,
+              new SqlNode[] {
+                      new SqlBasicCall(new SqlUnresolvedFunction(
+                                               new SqlIdentifier("OFFSET_IN_FRAGMENT",
+                                                       SqlParserPos.ZERO),
+                                               null,
+                                               null,
+                                               null,
+                                               null,
+                                               SqlFunctionCategory.USER_DEFINED_FUNCTION),
+                              new SqlNode[0],
+                              SqlParserPos.ZERO),
+                      new SqlIdentifier("EXPR$DELETE_OFFSET_IN_FRAGMENT", ZERO)},
+              ZERO));
+
+      select = new SqlSelect(SqlParserPos.ZERO,
+              null,
+              sourceExpression,
+              update.getTargetTable(),
+              update.getCondition(),
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null);
+    }
+
+    MapDPlanner planner = getPlanner(true, allowPushdownJoinCondition);
+    SqlNode node = planner.parse(select.toSqlString(SqlDialect.CALCITE).getSql());
+    node = planner.validate(node);
+    RelRoot root = planner.rel(node);
+    LogicalProject project = (LogicalProject) root.project();
+
+    ArrayList<String> fields = new ArrayList<String>();
+    ArrayList<RexNode> nodes = new ArrayList<RexNode>();
+    final RexBuilder builder = new RexBuilder(planner.getTypeFactory());
+
+    for (SqlNode n : update.getTargetColumnList()) {
+      if (n instanceof SqlIdentifier) {
+        SqlIdentifier id = (SqlIdentifier) n;
+        fields.add(id.names.get(id.names.size() - 1));
+      } else {
+        throw new RuntimeException("Unknown identifier type!");
+      }
+    }
+
+    int idx = 0;
+    for (RexNode exp : project.getChildExps()) {
+      if (applyRexCast && idx + 1 < project.getChildExps().size()) {
+        RelDataType expectedFieldType =
+                targetTableType.getField(fields.get(idx), false, false).getType();
+        if (!exp.getType().equals(expectedFieldType) && !exp.isA(ARRAY_VALUE)) {
+          exp = builder.makeCast(expectedFieldType, exp);
+        }
+      }
+
+      nodes.add(exp);
+      idx++;
+    }
+
+    ArrayList<RexNode> inputs = new ArrayList<RexNode>();
+    int n = 0;
+    for (int i = 0; i < fields.size(); i++) {
+      inputs.add(
+              new RexInputRef(n, project.getRowType().getFieldList().get(n).getType()));
+      n++;
+    }
+
+    fields.add("EXPR$DELETE_OFFSET_IN_FRAGMENT");
+    inputs.add(new RexInputRef(n, project.getRowType().getFieldList().get(n).getType()));
+
+    project = project.copy(
+            project.getTraitSet(), project.getInput(), nodes, project.getRowType());
+
+    LogicalTableModify modify = LogicalTableModify.create(targetTable,
+            dummyModify.getCatalogReader(),
+            project,
+            Operation.UPDATE,
+            fields,
+            inputs,
+            true);
+    return RelRoot.of(modify, SqlKind.UPDATE);
+  }
+
+  RelRoot queryToRelNode(final String sql, final MapDParserOptions parserOptions)
+          throws SqlParseException, ValidationException, RelConversionException {
+    final MapDPlanner planner = getPlanner(true, true);
+    final SqlNode sqlNode = parseSql(sql, parserOptions.isLegacySyntax(), planner);
+    return convertSqlToRelNode(sql, sqlNode, planner, parserOptions);
+  }
+
+  RelRoot convertSqlToRelNode(final String sql,
+          final SqlNode sqlNode,
+          final MapDPlanner mapDPlanner,
+          final MapDParserOptions parserOptions)
+          throws SqlParseException, ValidationException, RelConversionException {
+    SqlNode node = sqlNode;
+    MapDPlanner planner = mapDPlanner;
+    boolean allowCorrelatedSubQueryExpansion = true;
+    boolean allowPushdownJoinCondition = true;
+    boolean patchUpdateToDelete = false;
+
+    if (node.isA(DELETE)) {
+      SqlDelete sqlDelete = (SqlDelete) node;
+      node = new SqlUpdate(node.getParserPosition(),
+              sqlDelete.getTargetTable(),
+              SqlNodeList.EMPTY,
+              SqlNodeList.EMPTY,
+              sqlDelete.getCondition(),
+              sqlDelete.getSourceSelect(),
+              sqlDelete.getAlias());
+
+      patchUpdateToDelete = true;
+    }
+
+    if (node.isA(UPDATE)) {
+      SqlUpdate update = (SqlUpdate) node;
+      update = (SqlUpdate) planner.validate(update);
+      RelRoot root = rewriteUpdateAsSelect(update, parserOptions);
+
+      if (patchUpdateToDelete) {
+        LogicalTableModify modify = (LogicalTableModify) root.rel;
+
+        try {
+          Field f = TableModify.class.getDeclaredField("operation");
+          f.setAccessible(true);
+          f.set(modify, Operation.DELETE);
+        } catch (Throwable e) {
+          throw new RuntimeException(e);
+        }
+
+        root = RelRoot.of(modify, SqlKind.DELETE);
+      }
+
+      return root;
+    }
 
     if (parserOptions.isLegacySyntax()) {
       // close original planner
       planner.close();
       // create a new one
-      planner = getPlanner();
-      node = processSQL(node.toSqlString(SqlDialect.CALCITE).toString(), false, planner);
+      planner = getPlanner(allowCorrelatedSubQueryExpansion, allowPushdownJoinCondition);
+      node = parseSql(node.toSqlString(SqlDialect.CALCITE).toString(), false, planner);
     }
-
-    boolean is_select_star = isSelectStar(node);
 
     SqlNode validateR = planner.validate(node);
-    SqlSelect validate_select = getSelectChild(validateR);
-
-    // Hide rowid from select * queries
-    if (parserOptions.isLegacySyntax() && is_select_star && validate_select != null) {
-      SqlNodeList proj_exprs = ((SqlSelect) validateR).getSelectList();
-      SqlNodeList new_proj_exprs = new SqlNodeList(proj_exprs.getParserPosition());
-      for (SqlNode proj_expr : proj_exprs) {
-        final SqlNode unaliased_proj_expr = getUnaliasedExpression(proj_expr);
-
-        if (unaliased_proj_expr instanceof SqlIdentifier) {
-          if ((((SqlIdentifier) unaliased_proj_expr).toString().toLowerCase())
-                          .endsWith(".rowid")) {
-            continue;
-          }
-        }
-        new_proj_exprs.add(proj_expr);
-      }
-      validate_select.setSelectList(new_proj_exprs);
-
-      // trick planner back into correct state for validate
-      planner.close();
-      // create a new one
-      planner = getPlanner();
-      processSQL(validateR.toSqlString(SqlDialect.CALCITE).toString(), false, planner);
-      // now validate the new modified SqlNode;
-      validateR = planner.validate(validateR);
-    }
-
     planner.setFilterPushDownInfo(parserOptions.getFilterPushDownInfo());
     RelRoot relR = planner.rel(validateR);
     relR = replaceIsTrue(planner.getTypeFactory(), relR);
@@ -367,60 +860,22 @@ public final class MapDParser {
       }
     });
 
-    return new RelRoot(
-            node, root.validatedRowType, root.kind, root.fields, root.collation);
+    return new RelRoot(node,
+            root.validatedRowType,
+            root.kind,
+            root.fields,
+            root.collation,
+            Collections.emptyList());
   }
 
-  private static SqlNode getUnaliasedExpression(final SqlNode node) {
-    if (node instanceof SqlBasicCall
-            && ((SqlBasicCall) node).getOperator() instanceof SqlAsOperator) {
-      SqlNode[] operands = ((SqlBasicCall) node).getOperands();
-      return operands[0];
-    }
-    return node;
-  }
-
-  private static boolean isSelectStar(SqlNode node) {
-    SqlSelect select_node = getSelectChild(node);
-    if (select_node == null) {
-      return false;
-    }
-    SqlNode from = getUnaliasedExpression(select_node.getFrom());
-    if (from instanceof SqlCall) {
-      return false;
-    }
-    SqlNodeList proj_exprs = select_node.getSelectList();
-    if (proj_exprs.size() != 1) {
-      return false;
-    }
-    SqlNode proj_expr = proj_exprs.get(0);
-    if (!(proj_expr instanceof SqlIdentifier)) {
-      return false;
-    }
-    return ((SqlIdentifier) proj_expr).isStar();
-  }
-
-  private static SqlSelect getSelectChild(SqlNode node) {
-    if (node instanceof SqlSelect) {
-      return (SqlSelect) node;
-    }
-    if (node instanceof SqlOrderBy) {
-      SqlOrderBy order_by_node = (SqlOrderBy) node;
-      if (order_by_node.query instanceof SqlSelect) {
-        return (SqlSelect) order_by_node.query;
-      }
-    }
-    return null;
-  }
-
-  private SqlNode processSQL(String sql, final boolean legacy_syntax, Planner planner)
+  private SqlNode parseSql(String sql, final boolean legacy_syntax, Planner planner)
           throws SqlParseException {
     SqlNode parseR = null;
     try {
       parseR = planner.parse(sql);
       MAPDLOGGER.debug(" node is \n" + parseR.toString());
     } catch (SqlParseException ex) {
-      MAPDLOGGER.error("failed to process SQL '" + sql + "' \n" + ex.toString());
+      MAPDLOGGER.error("failed to parse SQL '" + sql + "' \n" + ex.toString());
       throw ex;
     }
 
@@ -856,7 +1311,7 @@ public final class MapDParser {
           throws SqlParseException {
     try {
       Planner planner = getPlanner();
-      SqlNode node = processSQL(sql, legacy_syntax, planner);
+      SqlNode node = parseSql(sql, legacy_syntax, planner);
       SqlIdentifierCapturer capturer = new SqlIdentifierCapturer();
       capturer.scan(node);
       return capturer;

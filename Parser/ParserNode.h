@@ -28,12 +28,17 @@
 #include <cstring>
 #include <list>
 #include <string>
+
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/process/search_path.hpp>
+
 #include "../Analyzer/Analyzer.h"
 #include "../Catalog/Catalog.h"
 #include "../Distributed/AggregatedResult.h"
 #include "../Shared/sqldefs.h"
 #include "../Shared/sqltypes.h"
 #include "ThriftHandler/QueryState.h"
+#include "Utils/DdlUtils.h"
 
 #include "../Fragmenter/InsertDataLoader.h"
 
@@ -63,30 +68,11 @@ class Node {
  * @type SQLType
  * @brief class that captures type, predication and scale.
  */
-class SQLType : public Node {
+class SQLType : public Node, public ddl_utils::SqlType {
  public:
-  explicit SQLType(SQLTypes t)
-      : type(t), param1(-1), param2(0), is_array(false), array_size(-1) {}
-  SQLType(SQLTypes t, int p1)
-      : type(t), param1(p1), param2(0), is_array(false), array_size(-1) {}
-  SQLType(SQLTypes t, int p1, int p2, bool a)
-      : type(t), param1(p1), param2(p2), is_array(a), array_size(-1) {}
-  SQLTypes get_type() const { return type; }
-  int get_param1() const { return param1; }
-  int get_param2() const { return param2; }
-  bool get_is_array() const { return is_array; }
-  void set_is_array(bool a) { is_array = a; }
-  int get_array_size() const { return array_size; }
-  void set_array_size(int s) { array_size = s; }
-  std::string to_string() const;
-  void check_type();
-
- private:
-  SQLTypes type;
-  int param1;  // e.g. for NUMERIC(10).  -1 means unspecified.
-  int param2;  // e.g. for NUMERIC(10,3). 0 is default value.
-  bool is_array;
-  int array_size;
+  explicit SQLType(SQLTypes t) : ddl_utils::SqlType(t, -1, 0, false, -1) {}
+  SQLType(SQLTypes t, int p1) : ddl_utils::SqlType(t, p1, 0, false, -1) {}
+  SQLType(SQLTypes t, int p1, int p2, bool a) : ddl_utils::SqlType(t, p1, p2, a, -1) {}
 };
 
 /*
@@ -789,15 +775,9 @@ class ColumnConstraintDef : public Node {
  * @type CompressDef
  * @brief Node for compression scheme definition
  */
-class CompressDef : public Node {
+class CompressDef : public Node, public ddl_utils::Encoding {
  public:
-  CompressDef(std::string* n, int p) : encoding_name(n), encoding_param(p) {}
-  const std::string* get_encoding_name() const { return encoding_name.get(); }
-  int get_encoding_param() const { return encoding_param; }
-
- private:
-  std::unique_ptr<std::string> encoding_name;
-  int encoding_param;
+  CompressDef(std::string* n, int p) : ddl_utils::Encoding(n, p) {}
 };
 
 /*
@@ -954,12 +934,23 @@ class NameValueAssign : public Node {
 };
 
 /*
+ * @type CreateTableBaseStmt
+ */
+class CreateTableBaseStmt : public DDLStmt {
+ public:
+  virtual const std::string* get_table() const = 0;
+  virtual const std::list<std::unique_ptr<TableElement>>& get_table_element_list()
+      const = 0;
+};
+
+/*
  * @type CreateTableStmt
  * @brief CREATE TABLE statement
  */
-class CreateTableStmt : public DDLStmt {
+class CreateTableStmt : public CreateTableBaseStmt {
  public:
   CreateTableStmt(std::string* tab,
+                  const std::string* storage,
                   std::list<TableElement*>* table_elems,
                   bool is_temporary,
                   bool if_not_exists,
@@ -977,8 +968,89 @@ class CreateTableStmt : public DDLStmt {
       delete s;
     }
   }
-  const std::string* get_table() const { return table_.get(); }
-  const std::list<std::unique_ptr<TableElement>>& get_table_element_list() const {
+  const std::string* get_table() const override { return table_.get(); }
+  const std::list<std::unique_ptr<TableElement>>& get_table_element_list()
+      const override {
+    return table_element_list_;
+  }
+
+  void execute(const Catalog_Namespace::SessionInfo& session) override;
+  void executeDryRun(const Catalog_Namespace::SessionInfo& session,
+                     TableDescriptor& td,
+                     std::list<ColumnDescriptor>& columns,
+                     std::vector<SharedDictionaryDef>& shared_dict_defs);
+
+ private:
+  std::unique_ptr<std::string> table_;
+  std::list<std::unique_ptr<TableElement>> table_element_list_;
+  bool is_temporary_;
+  bool if_not_exists_;
+  std::list<std::unique_ptr<NameValueAssign>> storage_options_;
+};
+
+struct DistributedConnector
+    : public Fragmenter_Namespace::InsertDataLoader::DistributedConnector {
+  virtual ~DistributedConnector() {}
+
+  virtual size_t getOuterFragmentCount(QueryStateProxy,
+                                       std::string& sql_query_string) = 0;
+  virtual std::vector<AggregatedResult> query(QueryStateProxy,
+                                              std::string& sql_query_string,
+                                              std::vector<size_t> outer_frag_indices) = 0;
+  virtual void checkpoint(const Catalog_Namespace::SessionInfo& parent_session_info,
+                          int tableId) = 0;
+  virtual void rollback(const Catalog_Namespace::SessionInfo& parent_session_info,
+                        int tableId) = 0;
+};
+
+struct LocalConnector : public DistributedConnector {
+  virtual ~LocalConnector() {}
+
+  size_t getOuterFragmentCount(QueryStateProxy, std::string& sql_query_string) override;
+
+  AggregatedResult query(QueryStateProxy,
+                         std::string& sql_query_string,
+                         std::vector<size_t> outer_frag_indices,
+                         bool validate_only);
+  std::vector<AggregatedResult> query(QueryStateProxy,
+                                      std::string& sql_query_string,
+                                      std::vector<size_t> outer_frag_indices) override;
+  size_t leafCount() override { return 1; };
+  void insertDataToLeaf(const Catalog_Namespace::SessionInfo& session,
+                        const size_t leaf_idx,
+                        Fragmenter_Namespace::InsertData& insert_data) override;
+  void checkpoint(const Catalog_Namespace::SessionInfo& session, int tableId) override;
+  void rollback(const Catalog_Namespace::SessionInfo& session, int tableId) override;
+  std::list<ColumnDescriptor> getColumnDescriptors(AggregatedResult& result,
+                                                   bool for_create);
+};
+
+/*
+ * @type CreateDataframeStmt
+ * @brief CREATE DATAFRAME statement
+ */
+class CreateDataframeStmt : public CreateTableBaseStmt {
+ public:
+  CreateDataframeStmt(std::string* tab,
+                      std::list<TableElement*>* table_elems,
+                      std::string* filename,
+                      std::list<NameValueAssign*>* s)
+      : table_(tab), filename_(filename) {
+    CHECK(table_elems);
+    for (const auto e : *table_elems) {
+      table_element_list_.emplace_back(e);
+    }
+    delete table_elems;
+    if (s) {
+      for (const auto e : *s) {
+        storage_options_.emplace_back(e);
+      }
+      delete s;
+    }
+  }
+  const std::string* get_table() const override { return table_.get(); }
+  const std::list<std::unique_ptr<TableElement>>& get_table_element_list()
+      const override {
     return table_element_list_;
   }
 
@@ -987,8 +1059,7 @@ class CreateTableStmt : public DDLStmt {
  private:
   std::unique_ptr<std::string> table_;
   std::list<std::unique_ptr<TableElement>> table_element_list_;
-  bool is_temporary_;
-  bool if_not_exists_;
+  std::unique_ptr<std::string> filename_;
   std::list<std::unique_ptr<NameValueAssign>> storage_options_;
 };
 
@@ -1014,37 +1085,12 @@ class InsertIntoTableAsSelectStmt : public DDLStmt {
     delete select_query;
   }
 
-  void populateData(QueryStateProxy, bool is_temporary, bool validate_table);
+  void populateData(QueryStateProxy, bool validate_table);
   void execute(const Catalog_Namespace::SessionInfo& session) override;
 
   std::string& get_table() { return table_name_; }
 
   std::string& get_select_query() { return select_query_; }
-
-  struct DistributedConnector
-      : public Fragmenter_Namespace::InsertDataLoader::DistributedConnector {
-    virtual AggregatedResult query(QueryStateProxy, std::string& sql_query_string) = 0;
-    virtual void checkpoint(const Catalog_Namespace::SessionInfo& parent_session_info,
-                            int tableId) = 0;
-    virtual void rollback(const Catalog_Namespace::SessionInfo& parent_session_info,
-                          int tableId) = 0;
-  };
-
-  struct LocalConnector : public DistributedConnector {
-    virtual ~LocalConnector() {}
-    AggregatedResult query(QueryStateProxy,
-                           std::string& sql_query_string,
-                           bool validate_only);
-    AggregatedResult query(QueryStateProxy, std::string& sql_query_string) override;
-    size_t leafCount() override { return 1; };
-    void insertDataToLeaf(const Catalog_Namespace::SessionInfo& session,
-                          const size_t leaf_idx,
-                          Fragmenter_Namespace::InsertData& insert_data) override;
-    void checkpoint(const Catalog_Namespace::SessionInfo& session, int tableId) override;
-    void rollback(const Catalog_Namespace::SessionInfo& session, int tableId) override;
-    std::list<ColumnDescriptor> getColumnDescriptors(AggregatedResult& result,
-                                                     bool for_create);
-  };
 
   DistributedConnector* leafs_connector_ = nullptr;
 
@@ -1252,13 +1298,125 @@ class AddColumnStmt : public DDLStmt {
     delete coldefs;
   }
   void execute(const Catalog_Namespace::SessionInfo& session) override;
-  void check_executable(const Catalog_Namespace::SessionInfo& session);
+  void check_executable(const Catalog_Namespace::SessionInfo& session,
+                        const TableDescriptor* td);
   const std::string* get_table() const { return table.get(); }
 
  private:
   std::unique_ptr<std::string> table;
   std::unique_ptr<ColumnDef> coldef;
   std::list<std::unique_ptr<ColumnDef>> coldefs;
+};
+
+class DropColumnStmt : public DDLStmt {
+ public:
+  DropColumnStmt(std::string* tab, std::list<std::string*>* cols) : table(tab) {
+    for (const auto col : *cols) {
+      this->columns.emplace_back(col);
+    }
+    delete cols;
+  }
+  void execute(const Catalog_Namespace::SessionInfo& session) override;
+  const std::string* get_table() const { return table.get(); }
+
+ private:
+  std::unique_ptr<std::string> table;
+  std::list<std::unique_ptr<std::string>> columns;
+};
+
+/*
+ * @type DumpTableStmt
+ * @brief DUMP TABLE table TO archive_file_path
+ */
+class DumpRestoreTableStmtBase : public DDLStmt {
+ public:
+  DumpRestoreTableStmtBase(std::string* tab,
+                           std::string* path,
+                           std::list<NameValueAssign*>* options,
+                           const bool is_restore)
+      : table(tab), path(path) {
+    auto options_deleter = [](std::list<NameValueAssign*>* options) {
+      for (auto option : *options) {
+        delete option;
+      }
+      delete options;
+    };
+    std::unique_ptr<std::list<NameValueAssign*>, decltype(options_deleter)> options_ptr(
+        options, options_deleter);
+    std::vector<std::string> allowed_compression_programs{"lz4", "gzip", "none"};
+    // specialize decompressor or break on osx bsdtar...
+    if (options) {
+      for (const auto option : *options) {
+        if (boost::iequals(*option->get_name(), "compression")) {
+          if (const auto str_literal =
+                  dynamic_cast<const StringLiteral*>(option->get_value())) {
+            compression = *str_literal->get_stringval();
+            const std::string lowercase_compression =
+                boost::algorithm::to_lower_copy(compression);
+            if (allowed_compression_programs.end() ==
+                std::find(allowed_compression_programs.begin(),
+                          allowed_compression_programs.end(),
+                          lowercase_compression)) {
+              throw std::runtime_error("Compression program " + compression +
+                                       " is not supported.");
+            }
+          } else {
+            throw std::runtime_error("Compression option must be a string.");
+          }
+        } else {
+          throw std::runtime_error("Invalid WITH option: " + *option->get_name());
+        }
+      }
+    }
+    // default lz4 compression, next gzip, or none.
+    if (compression.empty()) {
+      if (boost::process::search_path(compression = "gzip").string().empty()) {
+        if (boost::process::search_path(compression = "lz4").string().empty()) {
+          compression = "none";
+        }
+      }
+    }
+    if (boost::iequals(compression, "none")) {
+      compression.clear();
+    } else {
+      std::map<std::string, std::string> decompression{{"lz4", "unlz4"},
+                                                       {"gzip", "gunzip"}};
+      const auto use_program = is_restore ? decompression[compression] : compression;
+      const auto prog_path = boost::process::search_path(use_program);
+      if (prog_path.string().empty()) {
+        throw std::runtime_error("Compression program " + use_program + " is not found.");
+      }
+      compression = "--use-compress-program=" + use_program;
+    }
+  }
+  const std::string* getTable() const { return table.get(); }
+  const std::string* getPath() const { return path.get(); }
+  const std::string getCompression() const { return compression; }
+
+ protected:
+  std::unique_ptr<std::string> table;
+  std::unique_ptr<std::string> path;  // dump TO file path
+  std::string compression;
+};
+
+class DumpTableStmt : public DumpRestoreTableStmtBase {
+ public:
+  DumpTableStmt(std::string* tab, std::string* path, std::list<NameValueAssign*>* options)
+      : DumpRestoreTableStmtBase(tab, path, options, false) {}
+  void execute(const Catalog_Namespace::SessionInfo& session) override;
+};
+
+/*
+ * @type RestoreTableStmt
+ * @brief RESTORE TABLE table FROM archive_file_path
+ */
+class RestoreTableStmt : public DumpRestoreTableStmtBase {
+ public:
+  RestoreTableStmt(std::string* tab,
+                   std::string* path,
+                   std::list<NameValueAssign*>* options)
+      : DumpRestoreTableStmtBase(tab, path, options, true) {}
+  void execute(const Catalog_Namespace::SessionInfo& session) override;
 };
 
 /*
@@ -1268,7 +1426,7 @@ class AddColumnStmt : public DDLStmt {
 class CopyTableStmt : public DDLStmt {
  public:
   CopyTableStmt(std::string* t, std::string* f, std::list<NameValueAssign*>* o)
-      : table(t), file_pattern(f) {
+      : table(t), file_pattern(f), success(true) {
     if (o) {
       for (const auto e : *o) {
         options.emplace_back(e);
@@ -1290,6 +1448,8 @@ class CopyTableStmt : public DDLStmt {
     return *table;
   }
 
+  bool get_success() const { return success; }
+
   bool was_geo_copy_from() const { return _was_geo_copy_from; }
 
   void get_geo_copy_from_payload(std::string& geo_copy_from_table,
@@ -1306,6 +1466,7 @@ class CopyTableStmt : public DDLStmt {
  private:
   std::unique_ptr<std::string> table;
   std::unique_ptr<std::string> file_pattern;
+  bool success;
   std::list<std::unique_ptr<NameValueAssign>> options;
 
   bool _was_geo_copy_from = false;
@@ -1627,12 +1788,13 @@ class SelectStmt : public DMLStmt {
  */
 class ShowCreateTableStmt : public DDLStmt {
  public:
-  ShowCreateTableStmt(std::string* tab) : table(tab) {}
-  std::string get_create_stmt();
-  void execute(const Catalog_Namespace::SessionInfo& session) override { CHECK(false); }
+  ShowCreateTableStmt(std::string* tab) : table_(tab) {}
+  std::string getCreateStmt() { return create_stmt_; }
+  void execute(const Catalog_Namespace::SessionInfo& session) override;
 
  private:
-  std::unique_ptr<std::string> table;
+  std::unique_ptr<std::string> table_;
+  std::string create_stmt_;
 };
 
 /*
@@ -1652,6 +1814,8 @@ class ExportQueryStmt : public DDLStmt {
   }
   void execute(const Catalog_Namespace::SessionInfo& session) override;
   const std::string get_select_stmt() const { return *select_stmt; }
+
+  DistributedConnector* leafs_connector_ = nullptr;
 
  private:
   std::unique_ptr<std::string> select_stmt;
@@ -1837,24 +2001,10 @@ class InsertValuesStmt : public InsertStmt {
 
   size_t determineLeafIndex(const Catalog_Namespace::Catalog& catalog, size_t num_leafs);
 
+  void execute(const Catalog_Namespace::SessionInfo& session);
+
  private:
   std::list<std::unique_ptr<Expr>> value_list;
-};
-
-/*
- * @type InsertQueryStmt
- * @brief INSERT INTO ... SELECT ...
- */
-class InsertQueryStmt : public InsertStmt {
- public:
-  InsertQueryStmt(std::string* t, std::list<std::string*>* c, QuerySpec* q)
-      : InsertStmt(t, c), query(q) {}
-  const QuerySpec* get_query() const { return query.get(); }
-  void analyze(const Catalog_Namespace::Catalog& catalog,
-               Analyzer::Query& query) const override;
-
- private:
-  std::unique_ptr<QuerySpec> query;
 };
 
 /*
@@ -1944,6 +2094,15 @@ struct DefaultValidate<StringLiteral> {
     CHECK(val);
     const auto val_upper = boost::to_upper_copy<std::string>(*val);
     return val_upper;
+  }
+};
+
+struct CaseSensitiveValidate {
+  template <typename T>
+  decltype(auto) operator()(T t) {
+    const auto val = static_cast<const StringLiteral*>(t->get_value())->get_stringval();
+    CHECK(val);
+    return *val;
   }
 };
 

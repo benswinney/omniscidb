@@ -76,9 +76,12 @@ class CodeGenerator {
 
   static std::string generatePTX(const std::string& cuda_llir,
                                  llvm::TargetMachine* nvptx_target_machine,
-                                 CgenState* cgen_state);
+                                 llvm::LLVMContext& context);
 
-  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend();
+  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend(
+      const CudaMgr_Namespace::NvidiaDeviceArch arch);
+
+  static bool alwaysCloneRuntimeFunction(const llvm::Function* func);
 
   struct GPUCode {
     std::vector<std::pair<void*, void*>> native_functions;
@@ -99,6 +102,11 @@ class CodeGenerator {
       const std::unordered_set<llvm::Function*>& live_funcs,
       const CompilationOptions& co,
       const GPUTarget& gpu_target);
+
+  static void link_udf_module(const std::unique_ptr<llvm::Module>& udf_module,
+                              llvm::Module& module,
+                              CgenState* cgen_state,
+                              llvm::Linker::Flags flags = llvm::Linker::Flags::None);
 
   static bool prioritizeQuals(const RelAlgExecutionUnit& ra_exe_unit,
                               std::vector<Analyzer::Expr*>& primary_quals,
@@ -166,6 +174,8 @@ class CodeGenerator {
 
   llvm::Value* codegen(const Analyzer::KeyForStringExpr*, const CompilationOptions&);
 
+  llvm::Value* codegen(const Analyzer::LowerExpr*, const CompilationOptions&);
+
   llvm::Value* codegen(const Analyzer::LikeExpr*, const CompilationOptions&);
 
   llvm::Value* codegen(const Analyzer::RegexpExpr*, const CompilationOptions&);
@@ -178,6 +188,9 @@ class CodeGenerator {
 
   std::vector<llvm::Value*> codegenArrayExpr(const Analyzer::ArrayExpr*,
                                              const CompilationOptions&);
+
+  std::vector<llvm::Value*> codegenGeoExpr(const Analyzer::GeoExpr*,
+                                           const CompilationOptions&);
 
   llvm::Value* codegenFunctionOper(const Analyzer::FunctionOper*,
                                    const CompilationOptions&);
@@ -245,8 +258,8 @@ class CodeGenerator {
                                           const bool nullable);
 
   llvm::Value* codegenCastBetweenTimestamps(llvm::Value* ts_lv,
-                                            const int operand_dimen,
-                                            const int target_dimen,
+                                            const SQLTypeInfo& operand_dimen,
+                                            const SQLTypeInfo& target_dimen,
                                             const bool nullable);
 
   llvm::Value* codegenCastFromString(llvm::Value* operand_lv,
@@ -395,18 +408,24 @@ class CodeGenerator {
     llvm::BasicBlock* orig_bb;
   };
 
-  ArgNullcheckBBs beginArgsNullcheck(const Analyzer::FunctionOper* function_oper,
-                                     const std::vector<llvm::Value*>& orig_arg_lvs);
+  std::tuple<ArgNullcheckBBs, llvm::Value*> beginArgsNullcheck(
+      const Analyzer::FunctionOper* function_oper,
+      const std::vector<llvm::Value*>& orig_arg_lvs);
 
   llvm::Value* endArgsNullcheck(const ArgNullcheckBBs&,
+                                llvm::Value*,
                                 llvm::Value*,
                                 const Analyzer::FunctionOper*);
 
   llvm::Value* codegenFunctionOperNullArg(const Analyzer::FunctionOper*,
                                           const std::vector<llvm::Value*>&);
 
-  llvm::StructType* createArrayStructType(const std::string& udf_func_name,
-                                          size_t param_num);
+  llvm::Value* codegenCompression(const SQLTypeInfo& type_info);
+
+  std::pair<llvm::Value*, llvm::Value*> codegenArrayBuff(llvm::Value* chunk,
+                                                         llvm::Value* row_pos,
+                                                         SQLTypes array_type,
+                                                         bool cast_and_extend);
 
   void codegenArrayArgs(const std::string& udf_func_name,
                         size_t param_num,
@@ -414,6 +433,60 @@ class CodeGenerator {
                         llvm::Value* array_size,
                         llvm::Value* array_is_null,
                         std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createPointStructType(const std::string& udf_func_name,
+                                          size_t param_num);
+
+  void codegenGeoPointArgs(const std::string& udf_func_name,
+                           size_t param_num,
+                           llvm::Value* point_buf,
+                           llvm::Value* point_size,
+                           llvm::Value* compression,
+                           llvm::Value* input_srid,
+                           llvm::Value* output_srid,
+                           std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createLineStringStructType(const std::string& udf_func_name,
+                                               size_t param_num);
+
+  void codegenGeoLineStringArgs(const std::string& udf_func_name,
+                                size_t param_num,
+                                llvm::Value* line_string_buf,
+                                llvm::Value* line_string_size,
+                                llvm::Value* compression,
+                                llvm::Value* input_srid,
+                                llvm::Value* output_srid,
+                                std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createPolygonStructType(const std::string& udf_func_name,
+                                            size_t param_num);
+
+  void codegenGeoPolygonArgs(const std::string& udf_func_name,
+                             size_t param_num,
+                             llvm::Value* polygon_buf,
+                             llvm::Value* polygon_size,
+                             llvm::Value* ring_sizes_buf,
+                             llvm::Value* num_rings,
+                             llvm::Value* compression,
+                             llvm::Value* input_srid,
+                             llvm::Value* output_srid,
+                             std::vector<llvm::Value*>& output_args);
+
+  llvm::StructType* createMultiPolygonStructType(const std::string& udf_func_name,
+                                                 size_t param_num);
+
+  void codegenGeoMultiPolygonArgs(const std::string& udf_func_name,
+                                  size_t param_num,
+                                  llvm::Value* polygon_coords,
+                                  llvm::Value* polygon_coords_size,
+                                  llvm::Value* ring_sizes_buf,
+                                  llvm::Value* ring_sizes,
+                                  llvm::Value* polygon_bounds,
+                                  llvm::Value* polygon_bounds_sizes,
+                                  llvm::Value* compression,
+                                  llvm::Value* input_srid,
+                                  llvm::Value* output_srid,
+                                  std::vector<llvm::Value*>& output_args);
 
   std::vector<llvm::Value*> codegenFunctionOperCastArgs(
       const Analyzer::FunctionOper*,
@@ -507,3 +580,17 @@ class ScalarCodeGenerator : public CodeGenerator {
   std::vector<std::unique_ptr<GpuCompilationContext>> gpu_compilation_contexts_;
   std::unique_ptr<llvm::TargetMachine> nvptx_target_machine_;
 };
+
+/**
+ * Makes a shallow copy (just declarations) of the runtime module. Function definitions
+ * are cloned only if they're used from the generated code.
+ */
+std::unique_ptr<llvm::Module> runtime_module_shallow_copy(CgenState* cgen_state);
+
+/**
+ *  Loads individual columns from a single, packed pointers buffer (the byte stream arg)
+ */
+std::vector<llvm::Value*> generate_column_heads_load(const int num_columns,
+                                                     llvm::Value* byte_stream_arg,
+                                                     llvm::IRBuilder<>& ir_builder,
+                                                     llvm::LLVMContext& ctx);

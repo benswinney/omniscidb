@@ -19,6 +19,7 @@
 #include "Execute.h"
 #include "GpuInitGroups.h"
 #include "GpuMemUtils.h"
+#include "OutputBufferInitialization.h"
 #include "ResultSet.h"
 #include "Shared/Logger.h"
 #include "StreamingTopN.h"
@@ -218,37 +219,17 @@ QueryMemoryInitializer::QueryMemoryInitializer(
   }
   CHECK_GE(group_buffer_size, size_t(0));
 
+  const auto group_buffers_count = !query_mem_desc.isGroupBy() ? 1 : num_buffers_;
   std::unique_ptr<int64_t, CheckedAllocDeleter> group_by_buffer_template;
-  if (!query_mem_desc.lazyInitGroups(device_type)) {
+  if (!query_mem_desc.lazyInitGroups(device_type) && group_buffers_count > 1) {
     group_by_buffer_template.reset(
         static_cast<int64_t*>(checked_malloc(group_buffer_size)));
-
-    if (output_columnar) {
-      initColumnarGroups(
-          query_mem_desc, group_by_buffer_template.get(), init_agg_vals_, executor);
-    } else {
-      auto rows_ptr = group_by_buffer_template.get();
-      auto actual_entry_count = query_mem_desc.getEntryCount();
-      auto warp_size =
-          query_mem_desc.interleavedBins(device_type) ? executor->warpSize() : 1;
-      if (use_streaming_top_n(ra_exe_unit, query_mem_desc.didOutputColumnar())) {
-        const auto node_count_size = thread_count * sizeof(int64_t);
-        memset(rows_ptr, 0, node_count_size);
-        const auto n = ra_exe_unit.sort_info.offset + ra_exe_unit.sort_info.limit;
-        const auto rows_offset =
-            streaming_top_n::get_rows_offset_of_heaps(n, thread_count);
-        memset(rows_ptr + thread_count, -1, rows_offset - node_count_size);
-        rows_ptr += rows_offset / sizeof(int64_t);
-        actual_entry_count = n * thread_count;
-        warp_size = 1;
-      }
-      initGroups(query_mem_desc,
-                 rows_ptr,
-                 init_agg_vals_,
-                 actual_entry_count,
-                 warp_size,
-                 executor);
-    }
+    initGroupByBuffer(group_by_buffer_template.get(),
+                      ra_exe_unit,
+                      query_mem_desc,
+                      device_type,
+                      output_columnar,
+                      executor);
   }
 
   if (query_mem_desc.interleavedBins(device_type)) {
@@ -267,16 +248,23 @@ QueryMemoryInitializer::QueryMemoryInitializer(
   const auto actual_group_buffer_size =
       group_buffer_size + index_buffer_qw * sizeof(int64_t);
   CHECK_GE(actual_group_buffer_size, group_buffer_size);
-  const auto group_buffers_count = !query_mem_desc.isGroupBy() ? 1 : num_buffers_;
 
   for (size_t i = 0; i < group_buffers_count; i += step) {
     auto group_by_buffer =
         alloc_group_by_buffer(actual_group_buffer_size, render_allocator_map);
     if (!query_mem_desc.lazyInitGroups(device_type)) {
-      CHECK(group_by_buffer_template);
-      memcpy(group_by_buffer + index_buffer_qw,
-             group_by_buffer_template.get(),
-             group_buffer_size);
+      if (group_by_buffer_template) {
+        memcpy(group_by_buffer + index_buffer_qw,
+               group_by_buffer_template.get(),
+               group_buffer_size);
+      } else {
+        initGroupByBuffer(group_by_buffer + index_buffer_qw,
+                          ra_exe_unit,
+                          query_mem_desc,
+                          device_type,
+                          output_columnar,
+                          executor);
+      }
     }
     if (!render_allocator_map) {
       row_set_mem_owner_->addGroupByBuffer(group_by_buffer);
@@ -308,13 +296,119 @@ QueryMemoryInitializer::QueryMemoryInitializer(
   }
 }
 
+QueryMemoryInitializer::QueryMemoryInitializer(
+    const TableFunctionExecutionUnit& exe_unit,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const int device_id,
+    const ExecutorDeviceType device_type,
+    const int64_t num_rows,
+    const std::vector<std::vector<const int8_t*>>& col_buffers,
+    const std::vector<std::vector<uint64_t>>& frag_offsets,
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+    DeviceAllocator* device_allocator,
+    const Executor* executor)
+    : num_rows_(num_rows)
+    , row_set_mem_owner_(row_set_mem_owner)
+    , init_agg_vals_(init_agg_val_vec(exe_unit.target_exprs, {}, query_mem_desc))
+    , num_buffers_(/*computeNumberOfBuffers(query_mem_desc, device_type, executor)*/ 1)
+    , count_distinct_bitmap_mem_(0)
+    , count_distinct_bitmap_mem_bytes_(0)
+    , count_distinct_bitmap_crt_ptr_(nullptr)
+    , count_distinct_bitmap_host_mem_(nullptr)
+    , device_allocator_(device_allocator) {
+  // Table functions output columnar, basically treat this as a projection
+
+  const auto& consistent_frag_sizes = get_consistent_frags_sizes(frag_offsets);
+  if (consistent_frag_sizes.empty()) {
+    // No fragments in the input, no underlying buffers will be needed.
+    return;
+  }
+
+  size_t group_buffer_size{0};
+  // TODO(adb): this is going to give us an index buffer and then the target buffers. this
+  // might not be desireable -- revisit
+  group_buffer_size = query_mem_desc.getBufferSizeBytes(device_type, num_rows_);
+  CHECK_GE(group_buffer_size, size_t(0));
+
+  const auto index_buffer_qw =
+      device_type == ExecutorDeviceType::GPU && query_mem_desc.hasKeylessHash()
+          ? query_mem_desc.getEntryCount()
+          : size_t(0);
+  const auto actual_group_buffer_size =
+      group_buffer_size + index_buffer_qw * sizeof(int64_t);
+  CHECK_GE(actual_group_buffer_size, group_buffer_size);
+
+  CHECK_EQ(num_buffers_, size_t(1));
+  auto group_by_buffer = alloc_group_by_buffer(actual_group_buffer_size, nullptr);
+  if (!query_mem_desc.lazyInitGroups(device_type)) {
+    initColumnarGroups(
+        query_mem_desc, group_by_buffer + index_buffer_qw, init_agg_vals_, executor);
+  }
+  group_by_buffers_.push_back(group_by_buffer);
+  row_set_mem_owner_->addGroupByBuffer(group_by_buffer);
+
+  const auto column_frag_offsets =
+      get_col_frag_offsets(exe_unit.target_exprs, frag_offsets);
+  const auto column_frag_sizes =
+      get_consistent_frags_sizes(exe_unit.target_exprs, consistent_frag_sizes);
+  result_sets_.emplace_back(
+      new ResultSet(target_exprs_to_infos(exe_unit.target_exprs, query_mem_desc),
+                    {},
+                    col_buffers,
+                    column_frag_offsets,
+                    column_frag_sizes,
+                    device_type,
+                    device_id,
+                    ResultSet::fixupQueryMemoryDescriptor(query_mem_desc),
+                    row_set_mem_owner_,
+                    executor));
+  result_sets_.back()->allocateStorage(reinterpret_cast<int8_t*>(group_by_buffer),
+                                       init_agg_vals_);
+}
+
+void QueryMemoryInitializer::initGroupByBuffer(
+    int64_t* buffer,
+    const RelAlgExecutionUnit& ra_exe_unit,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const ExecutorDeviceType device_type,
+    const bool output_columnar,
+    const Executor* executor) {
+  if (output_columnar) {
+    initColumnarGroups(query_mem_desc, buffer, init_agg_vals_, executor);
+  } else {
+    auto rows_ptr = buffer;
+    auto actual_entry_count = query_mem_desc.getEntryCount();
+    const auto thread_count = device_type == ExecutorDeviceType::GPU
+                                  ? executor->blockSize() * executor->gridSize()
+                                  : 1;
+    auto warp_size =
+        query_mem_desc.interleavedBins(device_type) ? executor->warpSize() : 1;
+    if (query_mem_desc.useStreamingTopN()) {
+      const auto node_count_size = thread_count * sizeof(int64_t);
+      memset(rows_ptr, 0, node_count_size);
+      const auto n = ra_exe_unit.sort_info.offset + ra_exe_unit.sort_info.limit;
+      const auto rows_offset = streaming_top_n::get_rows_offset_of_heaps(n, thread_count);
+      memset(rows_ptr + thread_count, -1, rows_offset - node_count_size);
+      rows_ptr += rows_offset / sizeof(int64_t);
+      actual_entry_count = n * thread_count;
+      warp_size = 1;
+    }
+    initGroups(query_mem_desc,
+               rows_ptr,
+               init_agg_vals_,
+               actual_entry_count,
+               warp_size,
+               executor);
+  }
+}
+
 void QueryMemoryInitializer::initGroups(const QueryMemoryDescriptor& query_mem_desc,
                                         int64_t* groups_buffer,
                                         const std::vector<int64_t>& init_vals,
                                         const int32_t groups_buffer_entry_count,
                                         const size_t warp_size,
                                         const Executor* executor) {
-  const size_t key_count{query_mem_desc.groupColWidthsSize()};
+  const size_t key_count{query_mem_desc.getGroupbyColCount()};
   const size_t row_size{query_mem_desc.getRowSize()};
   const size_t col_base_off{query_mem_desc.getColOffInBytes(0)};
 
@@ -326,7 +420,7 @@ void QueryMemoryInitializer::initGroups(const QueryMemoryDescriptor& query_mem_d
 
   if (query_mem_desc.hasKeylessHash()) {
     CHECK(warp_size >= 1);
-    CHECK(key_count == 1);
+    CHECK(key_count == 1 || warp_size == 1);
     for (size_t warp_idx = 0; warp_idx < warp_size; ++warp_idx) {
       for (size_t bin = 0; bin < static_cast<size_t>(groups_buffer_entry_count);
            ++bin, buffer_ptr += row_size) {
@@ -379,45 +473,51 @@ void QueryMemoryInitializer::initColumnarGroups(
 
   const auto groups_buffer_entry_count = query_mem_desc.getEntryCount();
   if (!query_mem_desc.hasKeylessHash()) {
-    const size_t key_count{query_mem_desc.groupColWidthsSize()};
+    const size_t key_count{query_mem_desc.getGroupbyColCount()};
     for (size_t i = 0; i < key_count; ++i) {
       buffer_ptr = initColumnarBuffer<int64_t>(reinterpret_cast<int64_t*>(buffer_ptr),
                                                EMPTY_KEY_64,
                                                groups_buffer_entry_count);
     }
   }
-  // initializing all aggregate columns:
-  int32_t init_val_idx = 0;
-  for (int32_t i = 0; i < agg_col_count; ++i) {
-    if (query_mem_desc.getPaddedSlotWidthBytes(i) > 0) {
-      CHECK_LT(static_cast<size_t>(init_val_idx), init_vals.size());
-      switch (query_mem_desc.getPaddedSlotWidthBytes(i)) {
-        case 1:
-          buffer_ptr = initColumnarBuffer<int8_t>(
-              buffer_ptr, init_vals[init_val_idx++], groups_buffer_entry_count);
-          break;
-        case 2:
-          buffer_ptr = initColumnarBuffer<int16_t>(reinterpret_cast<int16_t*>(buffer_ptr),
-                                                   init_vals[init_val_idx++],
-                                                   groups_buffer_entry_count);
-          break;
-        case 4:
-          buffer_ptr = initColumnarBuffer<int32_t>(reinterpret_cast<int32_t*>(buffer_ptr),
-                                                   init_vals[init_val_idx++],
-                                                   groups_buffer_entry_count);
-          break;
-        case 8:
-          buffer_ptr = initColumnarBuffer<int64_t>(reinterpret_cast<int64_t*>(buffer_ptr),
-                                                   init_vals[init_val_idx++],
-                                                   groups_buffer_entry_count);
-          break;
-        case 0:
-          break;
-        default:
-          CHECK(false);
-      }
 
-      buffer_ptr = align_to_int64(buffer_ptr);
+  if (query_mem_desc.getQueryDescriptionType() != QueryDescriptionType::Projection) {
+    // initializing all aggregate columns:
+    int32_t init_val_idx = 0;
+    for (int32_t i = 0; i < agg_col_count; ++i) {
+      if (query_mem_desc.getPaddedSlotWidthBytes(i) > 0) {
+        CHECK_LT(static_cast<size_t>(init_val_idx), init_vals.size());
+        switch (query_mem_desc.getPaddedSlotWidthBytes(i)) {
+          case 1:
+            buffer_ptr = initColumnarBuffer<int8_t>(
+                buffer_ptr, init_vals[init_val_idx++], groups_buffer_entry_count);
+            break;
+          case 2:
+            buffer_ptr =
+                initColumnarBuffer<int16_t>(reinterpret_cast<int16_t*>(buffer_ptr),
+                                            init_vals[init_val_idx++],
+                                            groups_buffer_entry_count);
+            break;
+          case 4:
+            buffer_ptr =
+                initColumnarBuffer<int32_t>(reinterpret_cast<int32_t*>(buffer_ptr),
+                                            init_vals[init_val_idx++],
+                                            groups_buffer_entry_count);
+            break;
+          case 8:
+            buffer_ptr =
+                initColumnarBuffer<int64_t>(reinterpret_cast<int64_t*>(buffer_ptr),
+                                            init_vals[init_val_idx++],
+                                            groups_buffer_entry_count);
+            break;
+          case 0:
+            break;
+          default:
+            CHECK(false);
+        }
+
+        buffer_ptr = align_to_int64(buffer_ptr);
+      }
     }
   }
 }
@@ -606,7 +706,7 @@ GpuGroupByBuffers QueryMemoryInitializer::prepareTopNHeapsDevBuffer(
           dev_buffer + streaming_top_n::get_rows_offset_of_heaps(n, thread_count)),
       reinterpret_cast<int64_t*>(init_agg_vals_dev_ptr),
       n * thread_count,
-      query_mem_desc.groupColWidthsSize(),
+      query_mem_desc.getGroupbyColCount(),
       query_mem_desc.getEffectiveKeyWidth(),
       query_mem_desc.getRowSize() / sizeof(int64_t),
       query_mem_desc.hasKeylessHash(),
@@ -629,7 +729,7 @@ GpuGroupByBuffers QueryMemoryInitializer::createAndInitializeGroupByBufferGpu(
     const bool can_sort_on_gpu,
     const bool output_columnar,
     RenderAllocator* render_allocator) {
-  if (use_streaming_top_n(ra_exe_unit, query_mem_desc.didOutputColumnar())) {
+  if (query_mem_desc.useStreamingTopN()) {
     if (render_allocator) {
       throw StreamingTopNNotSupportedInRenderQuery();
     }
@@ -682,7 +782,7 @@ GpuGroupByBuffers QueryMemoryInitializer::createAndInitializeGroupByBufferGpu(
             reinterpret_cast<int64_t*>(group_by_dev_buffer),
             reinterpret_cast<const int64_t*>(init_agg_vals_dev_ptr),
             dev_group_by_buffers.entry_count,
-            query_mem_desc.groupColWidthsSize(),
+            query_mem_desc.getGroupbyColCount(),
             col_count,
             col_widths_dev_ptr,
             /*need_padding = */ true,
@@ -694,7 +794,7 @@ GpuGroupByBuffers QueryMemoryInitializer::createAndInitializeGroupByBufferGpu(
         init_group_by_buffer_on_device(reinterpret_cast<int64_t*>(group_by_dev_buffer),
                                        reinterpret_cast<int64_t*>(init_agg_vals_dev_ptr),
                                        dev_group_by_buffers.entry_count,
-                                       query_mem_desc.groupColWidthsSize(),
+                                       query_mem_desc.getGroupbyColCount(),
                                        query_mem_desc.getEffectiveKeyWidth(),
                                        query_mem_desc.getRowSize() / sizeof(int64_t),
                                        query_mem_desc.hasKeylessHash(),
@@ -707,6 +807,26 @@ GpuGroupByBuffers QueryMemoryInitializer::createAndInitializeGroupByBufferGpu(
   }
   return dev_group_by_buffers;
 }
+
+GpuGroupByBuffers QueryMemoryInitializer::setupTableFunctionGpuBuffers(
+    const QueryMemoryDescriptor& query_mem_desc,
+    const int device_id,
+    const unsigned block_size_x,
+    const unsigned grid_size_x) {
+  return create_dev_group_by_buffers(device_allocator_,
+                                     group_by_buffers_,
+                                     query_mem_desc,
+                                     block_size_x,
+                                     grid_size_x,
+                                     device_id,
+                                     ExecutorDispatchMode::MultifragmentKernel,
+                                     num_rows_,
+                                     false,
+                                     false,
+                                     false,
+                                     nullptr);
+}
+
 #endif
 
 size_t QueryMemoryInitializer::computeNumberOfBuffers(
@@ -799,7 +919,7 @@ void QueryMemoryInitializer::copyGroupByBuffersFromGpu(
     const QueryMemoryDescriptor& query_mem_desc,
     const size_t entry_count,
     const GpuGroupByBuffers& gpu_group_by_buffers,
-    const RelAlgExecutionUnit& ra_exe_unit,
+    const RelAlgExecutionUnit* ra_exe_unit,
     const unsigned block_size_x,
     const unsigned grid_size_x,
     const int device_id,
@@ -807,8 +927,8 @@ void QueryMemoryInitializer::copyGroupByBuffersFromGpu(
   const auto thread_count = block_size_x * grid_size_x;
 
   size_t total_buff_size{0};
-  if (use_streaming_top_n(ra_exe_unit, query_mem_desc.didOutputColumnar())) {
-    const size_t n = ra_exe_unit.sort_info.offset + ra_exe_unit.sort_info.limit;
+  if (ra_exe_unit && query_mem_desc.useStreamingTopN()) {
+    const size_t n = ra_exe_unit->sort_info.offset + ra_exe_unit->sort_info.limit;
     total_buff_size =
         streaming_top_n::get_heap_size(query_mem_desc.getRowSize(), n, thread_count);
   } else {

@@ -61,7 +61,7 @@ std::shared_ptr<Analyzer::Expr> ColumnVar::deep_copy() const {
 }
 
 void ExpressionTuple::collect_rte_idx(std::set<int>& rte_idx_set) const {
-  for (const auto column : tuple_) {
+  for (const auto& column : tuple_) {
     column->collect_rte_idx(rte_idx_set);
   }
 }
@@ -125,6 +125,10 @@ std::shared_ptr<Analyzer::Expr> CharLengthExpr::deep_copy() const {
 
 std::shared_ptr<Analyzer::Expr> KeyForStringExpr::deep_copy() const {
   return makeExpr<KeyForStringExpr>(arg->deep_copy());
+}
+
+std::shared_ptr<Analyzer::Expr> LowerExpr::deep_copy() const {
+  return makeExpr<LowerExpr>(arg->deep_copy());
 }
 
 std::shared_ptr<Analyzer::Expr> CardinalityExpr::deep_copy() const {
@@ -198,7 +202,11 @@ std::shared_ptr<Analyzer::Expr> WindowFunction::deep_copy() const {
 
 ExpressionPtr ArrayExpr::deep_copy() const {
   return makeExpr<Analyzer::ArrayExpr>(
-      type_info, contained_expressions_, expr_index_, local_alloc_);
+      type_info, contained_expressions_, expr_index_, is_null_, local_alloc_);
+}
+
+std::shared_ptr<Analyzer::Expr> GeoExpr::deep_copy() const {
+  return makeExpr<GeoExpr>(type_info, args_);
 }
 
 SQLTypeInfo BinOper::analyze_type_info(SQLOps op,
@@ -601,6 +609,13 @@ SQLTypeInfo BinOper::common_numeric_type(const SQLTypeInfo& type1,
     case kNUMERIC:
     case kDECIMAL:
       switch (type2.get_type()) {
+        case kTINYINT:
+          common_type =
+              SQLTypeInfo(kDECIMAL,
+                          std::max(3 + type1.get_scale(), type1.get_dimension()),
+                          type1.get_scale(),
+                          notnull);
+          break;
         case kSMALLINT:
           common_type =
               SQLTypeInfo(kDECIMAL,
@@ -1094,14 +1109,14 @@ void Constant::do_cast(const SQLTypeInfo& new_type_info) {
     const auto dimen = (type_info.get_type() == kDATE) ? 0 : type_info.get_dimension();
     if (dimen != new_type_info.get_dimension()) {
       constval.bigintval = dimen < new_type_info.get_dimension()
-                               ? DateTruncateAlterPrecisionScaleUp(
+                               ? DateTimeUtils::get_datetime_scaled_epoch(
+                                     DateTimeUtils::ScalingType::ScaleUp,
                                      constval.bigintval,
-                                     DateTimeUtils::get_timestamp_precision_scale(
-                                         new_type_info.get_dimension() - dimen))
-                               : DateTruncateAlterPrecisionScaleDown(
+                                     new_type_info.get_dimension() - dimen)
+                               : DateTimeUtils::get_datetime_scaled_epoch(
+                                     DateTimeUtils::ScalingType::ScaleDown,
                                      constval.bigintval,
-                                     DateTimeUtils::get_timestamp_precision_scale(
-                                         dimen - new_type_info.get_dimension()));
+                                     dimen - new_type_info.get_dimension());
     }
     type_info = new_type_info;
   } else if (new_type_info.is_array() && type_info.is_array()) {
@@ -1115,7 +1130,7 @@ void Constant::do_cast(const SQLTypeInfo& new_type_info) {
     }
     type_info = new_type_info;
   } else if (get_is_null() && (new_type_info.is_number() || new_type_info.is_time() ||
-                               new_type_info.is_string())) {
+                               new_type_info.is_string() || new_type_info.is_boolean())) {
     type_info = new_type_info;
     set_null_value();
   } else {
@@ -1192,8 +1207,9 @@ std::shared_ptr<Analyzer::Expr> Constant::add_cast(const SQLTypeInfo& new_type_i
     }
     return Expr::add_cast(new_type_info);
   }
-  if (is_member_of_typeset<kINT, kDECIMAL, kFLOAT, kDOUBLE>(new_type_info) &&
-      is_member_of_typeset<kTIME, kDATE>(type_info)) {
+  const auto is_integral_type =
+      new_type_info.is_integer() || new_type_info.is_decimal() || new_type_info.is_fp();
+  if (is_integral_type && (type_info.is_time() || type_info.is_date())) {
     // Let the codegen phase deal with casts from date/time to a number.
     return makeExpr<UOper>(new_type_info, contains_agg, kCAST, shared_from_this());
   }
@@ -1485,6 +1501,20 @@ void CharLengthExpr::group_predicates(std::list<const Expr*>& scan_predicates,
 void KeyForStringExpr::group_predicates(std::list<const Expr*>& scan_predicates,
                                         std::list<const Expr*>& join_predicates,
                                         std::list<const Expr*>& const_predicates) const {
+  std::set<int> rte_idx_set;
+  arg->collect_rte_idx(rte_idx_set);
+  if (rte_idx_set.size() > 1) {
+    join_predicates.push_back(this);
+  } else if (rte_idx_set.size() == 1) {
+    scan_predicates.push_back(this);
+  } else {
+    const_predicates.push_back(this);
+  }
+}
+
+void LowerExpr::group_predicates(std::list<const Expr*>& scan_predicates,
+                                 std::list<const Expr*>& join_predicates,
+                                 std::list<const Expr*>& const_predicates) const {
   std::set<int> rte_idx_set;
   arg->collect_rte_idx(rte_idx_set);
   if (rte_idx_set.size() > 1) {
@@ -2046,6 +2076,14 @@ bool KeyForStringExpr::operator==(const Expr& rhs) const {
   return true;
 }
 
+bool LowerExpr::operator==(const Expr& rhs) const {
+  if (typeid(rhs) != typeid(LowerExpr)) {
+    return false;
+  }
+
+  return *arg == *dynamic_cast<const LowerExpr&>(rhs).get_arg();
+}
+
 bool CardinalityExpr::operator==(const Expr& rhs) const {
   if (typeid(rhs) != typeid(CardinalityExpr)) {
     return false;
@@ -2234,7 +2272,23 @@ bool ArrayExpr::operator==(Expr const& rhs) const {
       return false;
     }
   }
+  if (isNull() != casted_rhs.isNull()) {
+    return false;
+  }
+
   return true;
+  ;
+}
+
+bool GeoExpr::operator==(const Expr& rhs) const {
+  const auto rhs_geo = dynamic_cast<const GeoExpr*>(&rhs);
+  if (!rhs_geo) {
+    return false;
+  }
+  if (args_.size() != rhs_geo->args_.size()) {
+    return false;
+  }
+  return expr_list_match(args_, rhs_geo->args_);
 }
 
 std::string ColumnVar::toString() const {
@@ -2426,6 +2480,10 @@ std::string KeyForStringExpr::toString() const {
   return str;
 }
 
+std::string LowerExpr::toString() const {
+  return "LOWER(" + arg->toString() + ") ";
+}
+
 std::string CardinalityExpr::toString() const {
   std::string str{"CARDINALITY("};
   str += arg->toString();
@@ -2481,6 +2539,9 @@ std::string AggExpr::toString() const {
       break;
     case kAPPROX_COUNT_DISTINCT:
       agg = "APPROX_COUNT_DISTINCT";
+      break;
+    case kSINGLE_VALUE:
+      agg = "SINGLE_VALUE";
       break;
     case kSAMPLE:
       agg = "SAMPLE";
@@ -2560,6 +2621,15 @@ std::string ArrayExpr::toString() const {
   return str;
 }
 
+std::string GeoExpr::toString() const {
+  // TODO: generate ST_GeomFromText(wkt)
+  std::string result = "Geo(";
+  for (const auto& arg : args_) {
+    result += " " + arg->toString();
+  }
+  return result + ") ";
+}
+
 std::string TargetEntry::toString() const {
   std::string str{"(" + resname + " "};
   str += expr->toString();
@@ -2637,6 +2707,15 @@ void KeyForStringExpr::find_expr(bool (*f)(const Expr*),
     return;
   }
   arg->find_expr(f, expr_list);
+}
+
+void LowerExpr::find_expr(bool (*f)(const Expr*),
+                          std::list<const Expr*>& expr_list) const {
+  if (f(this)) {
+    add_unique(expr_list);
+  } else {
+    arg->find_expr(f, expr_list);
+  }
 }
 
 void CardinalityExpr::find_expr(bool (*f)(const Expr*),
@@ -2936,7 +3015,7 @@ bool FunctionOper::operator==(const Expr& rhs) const {
 
 std::string FunctionOper::toString() const {
   std::string str{"(" + name_ + " "};
-  for (const auto arg : args_) {
+  for (const auto& arg : args_) {
     str += arg->toString();
   }
   str += ")";

@@ -51,17 +51,19 @@ class QueryExecutionContext;
 class RenderInfo;
 class RowSetMemoryOwner;
 struct InputTableInfo;
-
-// Shared: threads in the same block share memory, atomic operations required
-// SharedForKeylessOneColumnKnownRange: special case of "Shared", but for keyless
-// aggregates with single column group by
-enum class GroupByMemSharing { Shared, SharedForKeylessOneColumnKnownRange };
-
 struct RelAlgExecutionUnit;
 class TResultSetBufferDescriptor;
 class GroupByAndAggregate;
 struct ColRangeInfo;
 struct KeylessInfo;
+
+class StreamingTopNOOM : public std::runtime_error {
+ public:
+  StreamingTopNOOM(const size_t heap_size_bytes)
+      : std::runtime_error("Unable to use streaming top N due to required heap size of " +
+                           std::to_string(heap_size_bytes) +
+                           " bytes exceeding maximum slab size.") {}
+};
 
 class QueryMemoryDescriptor {
  public:
@@ -81,17 +83,17 @@ class QueryMemoryDescriptor {
                         const int8_t group_col_compact_width,
                         const std::vector<ssize_t>& target_groupby_indices,
                         const size_t entry_count,
-                        const GroupByMemSharing sharing,
-                        const bool shared_mem_for_group_by,
                         const CountDistinctDescriptors count_distinct_descriptors,
                         const bool sort_on_gpu_hint,
                         const bool output_columnar,
                         const bool render_output,
-                        const bool must_use_baseline_sort);
+                        const bool must_use_baseline_sort,
+                        const bool use_streaming_top_n);
 
   QueryMemoryDescriptor(const Executor* executor,
                         const size_t entry_count,
-                        const QueryDescriptionType query_desc_type);
+                        const QueryDescriptionType query_desc_type,
+                        const bool is_table_function);
 
   QueryMemoryDescriptor(const QueryDescriptionType query_desc_type,
                         const int64_t min_val,
@@ -120,7 +122,8 @@ class QueryMemoryDescriptor {
       RenderInfo* render_info,
       const CountDistinctDescriptors count_distinct_descriptors,
       const bool must_use_baseline_sort,
-      const bool output_columnar_hint);
+      const bool output_columnar_hint,
+      const bool streaming_top_n_hint);
 
   std::unique_ptr<QueryExecutionContext> getQueryExecutionContext(
       const RelAlgExecutionUnit&,
@@ -178,7 +181,6 @@ class QueryMemoryDescriptor {
   int32_t getTargetIdxForKey() const { return idx_target_as_key_; }
   void setTargetIdxForKey(const int32_t val) { idx_target_as_key_ = val; }
 
-  size_t groupColWidthsSize() const { return group_col_widths_.size(); }
   int8_t groupColWidth(const size_t key_idx) const {
     CHECK_LT(key_idx, group_col_widths_.size());
     return group_col_widths_[key_idx];
@@ -225,7 +227,18 @@ class QueryMemoryDescriptor {
     CHECK_LT(target_idx, target_groupby_indices_.size());
     return target_groupby_indices_[target_idx];
   }
+
+  void setAllTargetGroupbyIndices(std::vector<ssize_t> group_by_indices) {
+    target_groupby_indices_ = group_by_indices;
+  }
+
   size_t targetGroupbyIndicesSize() const { return target_groupby_indices_.size(); }
+  size_t targetGroupbyNegativeIndicesSize() const {
+    return std::count_if(
+        target_groupby_indices_.begin(),
+        target_groupby_indices_.end(),
+        [](const ssize_t& target_group_by_index) { return target_group_by_index < 0; });
+  }
   void clearTargetGroupbyIndices() { target_groupby_indices_.clear(); }
 
   size_t getEntryCount() const { return entry_count_; }
@@ -236,7 +249,6 @@ class QueryMemoryDescriptor {
   int64_t getBucket() const { return bucket_; }
 
   bool hasNulls() const { return has_nulls_; }
-  GroupByMemSharing getGpuMemSharing() const { return sharing_; }
 
   const CountDistinctDescriptor& getCountDistinctDescriptor(const size_t idx) const {
     CHECK_LT(idx, count_distinct_descriptors_.size());
@@ -251,6 +263,8 @@ class QueryMemoryDescriptor {
   bool canOutputColumnar() const;
   bool didOutputColumnar() const { return output_columnar_; }
   void setOutputColumnar(const bool val);
+
+  bool useStreamingTopN() const { return use_streaming_top_n_; }
 
   bool isLogicalSizedColumnsAllowed() const;
 
@@ -285,8 +299,6 @@ class QueryMemoryDescriptor {
 
   bool interleavedBins(const ExecutorDeviceType) const;
 
-  size_t sharedMemBytes(const ExecutorDeviceType) const;
-
   size_t getColOffInBytes(const size_t col_idx) const;
   size_t getColOffInBytesInNextBin(const size_t col_idx) const;
   size_t getNextColOffInBytes(const int8_t* col_ptr,
@@ -305,7 +317,10 @@ class QueryMemoryDescriptor {
 
   bool isWarpSyncRequired(const ExecutorDeviceType) const;
 
+  std::string queryDescTypeToString() const;
   std::string toString() const;
+
+  std::string reductionKey() const;
 
  protected:
   void resetGroupColWidths(const std::vector<int8_t>& new_group_col_widths) {
@@ -333,12 +348,13 @@ class QueryMemoryDescriptor {
   int64_t max_val_;
   int64_t bucket_;
   bool has_nulls_;
-  GroupByMemSharing sharing_;  // meaningful for GPU only
   CountDistinctDescriptors count_distinct_descriptors_;
   bool sort_on_gpu_;
   bool output_columnar_;
   bool render_output_;
   bool must_use_baseline_sort_;
+  bool is_table_function_;
+  bool use_streaming_top_n_;
 
   bool force_4byte_float_;
 
@@ -350,9 +366,6 @@ class QueryMemoryDescriptor {
 
   friend class ResultSet;
   friend class QueryExecutionContext;
-
-  template <typename META_CLASS_TYPE>
-  friend class AggregateReductionEgress;
 };
 
 inline void set_notnull(TargetInfo& target, const bool not_null) {

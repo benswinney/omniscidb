@@ -14,14 +14,24 @@
  * limitations under the License.
  */
 
-#include "CudaMgr.h"
+#include "CudaMgr/CudaMgr.h"
+
 #include <algorithm>
 #include <cassert>
 #include <iostream>
 #include <stdexcept>
+
 #include "Shared/Logger.h"
 
 namespace CudaMgr_Namespace {
+
+std::string errorMessage(CUresult const status) {
+  const char* errorString{nullptr};
+  cuGetErrorString(status, &errorString);
+  return errorString
+             ? "CUDA Error (" + std::to_string(status) + "): " + std::string(errorString)
+             : "CUDA Driver API error code " + std::to_string(status);
+}
 
 CudaMgr::CudaMgr(const int num_gpus, const int start_gpu)
     : start_gpu_(start_gpu), max_shared_memory_for_all_(0) {
@@ -36,8 +46,16 @@ CudaMgr::CudaMgr(const int num_gpus, const int start_gpu)
     CHECK_EQ(start_gpu_, 0);
   }
   fillDeviceProperties();
+  initDeviceGroup();
   createDeviceContexts();
   printDeviceProperties();
+}
+
+void CudaMgr::initDeviceGroup() {
+  for (int device_id = 0; device_id < device_count_; device_id++) {
+    device_group_.push_back(
+        {device_id, device_id + start_gpu_, device_properties_[device_id].uuid});
+  }
 }
 
 CudaMgr::~CudaMgr() {
@@ -133,12 +151,21 @@ void CudaMgr::unloadGpuModuleData(CUmodule* module, const int device_id) const {
   }
 }
 
+CudaMgr::CudaMemoryUsage CudaMgr::getCudaMemoryUsage() {
+  CudaMemoryUsage usage;
+  cuMemGetInfo(&usage.free, &usage.total);
+  return usage;
+}
+
 void CudaMgr::fillDeviceProperties() {
   device_properties_.resize(device_count_);
   cuDriverGetVersion(&gpu_driver_version_);
   for (int device_num = 0; device_num < device_count_; ++device_num) {
     checkError(
         cuDeviceGet(&device_properties_[device_num].device, device_num + start_gpu_));
+    CUuuid cuda_uuid;
+    checkError(cuDeviceGetUuid(&cuda_uuid, device_properties_[device_num].device));
+    device_properties_[device_num].uuid = omnisci::UUID(cuda_uuid.bytes);
     checkError(cuDeviceGetAttribute(&device_properties_[device_num].computeMajor,
                                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
                                     device_properties_[device_num].device));
@@ -285,8 +312,12 @@ void CudaMgr::createDeviceContexts() {
         try {
           checkError(cuCtxDestroy(device_contexts_[destroy_id]));
         } catch (const CudaErrorException& e) {
-          LOG(ERROR) << "Error destroying context after failed creation for device "
-                     << destroy_id;
+          LOG(ERROR) << "Failed to destroy CUDA context for device ID " << destroy_id
+                     << " with " << e.what()
+                     << ". CUDA contexts were being destroyed due to an error creating "
+                        "CUDA context for device ID "
+                     << d << " out of " << device_count_ << " (" << errorMessage(status)
+                     << ").";
         }
       }
       // checkError will translate the message and throw
@@ -305,13 +336,14 @@ void CudaMgr::printDeviceProperties() const {
   LOG(INFO) << "Using " << device_count_ << " Gpus.";
   for (int d = 0; d < device_count_; ++d) {
     VLOG(1) << "Device: " << device_properties_[d].device;
+    VLOG(1) << "UUID: " << device_properties_[d].uuid;
     VLOG(1) << "Clock (khz): " << device_properties_[d].clockKhz;
     VLOG(1) << "Compute Major: " << device_properties_[d].computeMajor;
     VLOG(1) << "Compute Minor: " << device_properties_[d].computeMinor;
     VLOG(1) << "PCI bus id: " << device_properties_[d].pciBusId;
     VLOG(1) << "PCI deviceId id: " << device_properties_[d].pciDeviceId;
-    VLOG(1) << "Total Global memory: " << device_properties_[d].globalMem / 1073741824.0
-            << " GB";
+    VLOG(1) << "Per device global memory: "
+            << device_properties_[d].globalMem / 1073741824.0 << " GB";
     VLOG(1) << "Memory clock (khz): " << device_properties_[d].memoryClockKhz;
     VLOG(1) << "Memory bandwidth: " << device_properties_[d].memoryBandwidthGBs
             << " GB/sec";

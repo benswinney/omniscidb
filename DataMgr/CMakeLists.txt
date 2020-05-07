@@ -8,12 +8,19 @@ set(datamgr_source_files
     FileMgr/FileMgr.cpp
     FileMgr/FileBuffer.cpp
     FileMgr/FileInfo.cpp
+    ForeignStorage/ArrowCsvForeignStorage.cpp
+    ForeignStorage/DummyForeignStorage.cpp
+    ForeignStorage/ForeignStorageInterface.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBuffer.cpp
     BufferMgr/CpuBufferMgr/CpuBufferMgr.cpp
     BufferMgr/CpuBufferMgr/CpuBuffer.cpp
     BufferMgr/BufferMgr.cpp
     BufferMgr/Buffer.cpp
+    ForeignStorage/ForeignStorageBuffer.cpp
+    ForeignStorage/ForeignStorageMgr.cpp
+    ForeignStorage/CsvDataWrapper.cpp
+    PersistentStorageMgr/PersistentStorageMgr.cpp
 )
 
 add_library(DataMgr ${datamgr_source_files})

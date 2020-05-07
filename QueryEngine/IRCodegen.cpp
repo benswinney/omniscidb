@@ -17,6 +17,7 @@
 #include "../Parser/ParserNode.h"
 #include "CodeGenerator.h"
 #include "Execute.h"
+#include "ExternalExecutor.h"
 #include "MaxwellCodegenPatch.h"
 #include "RelAlgTranslator.h"
 
@@ -42,16 +43,23 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
   }
   auto constant = dynamic_cast<const Analyzer::Constant*>(expr);
   if (constant) {
+    const auto& ti = constant->get_type_info();
+    if (ti.get_type() == kNULLT) {
+      throw std::runtime_error(
+          "NULL type literals are not currently supported in this context.");
+    }
     if (constant->get_is_null()) {
-      const auto& ti = constant->get_type_info();
       return {ti.is_fp()
                   ? static_cast<llvm::Value*>(executor_->cgen_state_->inlineFpNull(ti))
                   : static_cast<llvm::Value*>(executor_->cgen_state_->inlineIntNull(ti))};
     }
-    // The dictionary encoding case should be handled by the parent expression
-    // (cast, for now), here is too late to know the dictionary id
-    CHECK_NE(kENCODING_DICT, constant->get_type_info().get_compression());
-    return {codegen(constant, constant->get_type_info().get_compression(), 0, co)};
+    if (ti.get_compression() == kENCODING_DICT) {
+      // The dictionary encoding case should be handled by the parent expression
+      // (cast, for now), here is too late to know the dictionary id if not already set
+      CHECK_NE(ti.get_comp_param(), 0);
+      return {codegen(constant, ti.get_compression(), ti.get_comp_param(), co)};
+    }
+    return {codegen(constant, ti.get_compression(), 0, co)};
   }
   auto case_expr = dynamic_cast<const Analyzer::CaseExpr*>(expr);
   if (case_expr) {
@@ -80,6 +88,10 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
   auto keyforstring_expr = dynamic_cast<const Analyzer::KeyForStringExpr*>(expr);
   if (keyforstring_expr) {
     return {codegen(keyforstring_expr, co)};
+  }
+  auto lower_expr = dynamic_cast<const Analyzer::LowerExpr*>(expr);
+  if (lower_expr) {
+    return {codegen(lower_expr, co)};
   }
   auto cardinality_expr = dynamic_cast<const Analyzer::CardinalityExpr*>(expr);
   if (cardinality_expr) {
@@ -115,6 +127,10 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
   if (array_oper_expr) {
     return {codegenArrayExpr(array_oper_expr, co)};
   }
+  auto geo_expr = dynamic_cast<const Analyzer::GeoExpr*>(expr);
+  if (geo_expr) {
+    return {codegenGeoExpr(geo_expr, co)};
+  }
   auto function_oper_expr = dynamic_cast<const Analyzer::FunctionOper*>(expr);
   if (function_oper_expr) {
     return {codegenFunctionOper(function_oper_expr, co)};
@@ -123,7 +139,7 @@ std::vector<llvm::Value*> CodeGenerator::codegen(const Analyzer::Expr* expr,
     return {posArg(nullptr)};
   }
   if (dynamic_cast<const Analyzer::WindowFunction*>(expr)) {
-    throw std::runtime_error("Window expression not supported in this context");
+    throw NativeExecutionError("Window expression not supported in this context");
   }
   abort();
 }
@@ -328,6 +344,9 @@ std::function<llvm::Value*(const std::vector<llvm::Value*>&, llvm::Value*)>
 Executor::buildIsDeletedCb(const RelAlgExecutionUnit& ra_exe_unit,
                            const size_t level_idx,
                            const CompilationOptions& co) {
+  if (!co.add_delete_column) {
+    return nullptr;
+  }
   CHECK_LT(level_idx + 1, ra_exe_unit.input_descs.size());
   const auto input_desc = ra_exe_unit.input_descs[level_idx + 1];
   if (input_desc.getSourceType() != InputSourceType::TABLE) {
@@ -408,8 +427,8 @@ std::shared_ptr<JoinHashTableInterface> Executor::buildCurrentLevelHashTable(
       hash_table_or_error = buildHashTableForQualifier(
           qual_bin_oper,
           query_infos,
-          co.device_type_ == ExecutorDeviceType::GPU ? MemoryLevel::GPU_LEVEL
-                                                     : MemoryLevel::CPU_LEVEL,
+          co.device_type == ExecutorDeviceType::GPU ? MemoryLevel::GPU_LEVEL
+                                                    : MemoryLevel::CPU_LEVEL,
           JoinHashTableInterface::HashType::OneToOne,
           column_cache);
       current_level_hash_table = hash_table_or_error.hash_table;
@@ -476,9 +495,11 @@ void Executor::codegenJoinLoops(const std::vector<JoinLoop>& join_loops,
         const bool can_return_error =
             compileBody(ra_exe_unit, group_by_and_aggregate, query_mem_desc, co);
         if (can_return_error || cgen_state_->needs_error_check_ ||
-            eo.with_dynamic_watchdog) {
-          createErrorCheckControlFlow(
-              query_func, eo.with_dynamic_watchdog, co.device_type_);
+            eo.with_dynamic_watchdog || eo.allow_runtime_query_interrupt) {
+          createErrorCheckControlFlow(query_func,
+                                      eo.with_dynamic_watchdog,
+                                      eo.allow_runtime_query_interrupt,
+                                      co.device_type);
         }
         return loop_body_bb;
       },
@@ -561,7 +582,7 @@ Executor::GroupColLLVMValue Executor::groupByColumnCodegen(
         ar_ret_ty,
         {group_key, code_generator.posArg(arr_expr), array_idx});
     if (need_patch_unnest_double(
-            elem_ti, isArchMaxwell(co.device_type_), thread_mem_shared)) {
+            elem_ti, isArchMaxwell(co.device_type), thread_mem_shared)) {
       key_to_cache = spillDoubleElement(group_key, ar_ret_ty);
     } else {
       key_to_cache = group_key;

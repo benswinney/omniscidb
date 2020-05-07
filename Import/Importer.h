@@ -22,9 +22,6 @@
 #ifndef _IMPORTER_H_
 #define _IMPORTER_H_
 
-#include "Shared/Logger.h"
-#include "Shared/fixautotools.h"
-
 #include <gdal.h>
 #include <ogrsf_frmts.h>
 
@@ -44,14 +41,15 @@
 #include <string>
 #include <utility>
 
-#include "../Catalog/Catalog.h"
-#include "../Catalog/TableDescriptor.h"
-#include "../Chunk/Chunk.h"
-#include "../Fragmenter/Fragmenter.h"
-#include "../Shared/ThreadController.h"
-#include "../Shared/checked_alloc.h"
-
-#include "QueryRunner/QueryRunner.h"
+#include "Catalog/Catalog.h"
+#include "Catalog/TableDescriptor.h"
+#include "Chunk/Chunk.h"
+#include "Fragmenter/Fragmenter.h"
+#include "Import/CopyParams.h"
+#include "Shared/Logger.h"
+#include "Shared/ThreadController.h"
+#include "Shared/checked_alloc.h"
+#include "Shared/fixautotools.h"
 
 // Some builds of boost::geometry require iostream, but don't explicitly include it.
 // Placing in own section to ensure it's included after iostream.
@@ -59,9 +57,6 @@
 
 class TDatum;
 class TColumn;
-
-// not too big (need much memory) but not too small (many thread forks)
-constexpr static size_t kImportFileBufferSize = (1 << 23);
 
 namespace arrow {
 
@@ -82,103 +77,6 @@ struct BadRowsTracker {
   std::string file_name;
   int row_group;
   Importer* importer;
-};
-
-enum class FileType {
-  DELIMITED,
-  POLYGON
-#ifdef ENABLE_IMPORT_PARQUET
-  ,
-  PARQUET
-#endif
-};
-
-enum class ImportHeaderRow { AUTODETECT, NO_HEADER, HAS_HEADER };
-
-struct CopyParams {
-  char delimiter;
-  std::string null_str;
-  ImportHeaderRow has_header;
-  bool quoted;  // does the input have any quoted fields, default to false
-  char quote;
-  char escape;
-  char line_delim;
-  char array_delim;
-  char array_begin;
-  char array_end;
-  int threads;
-  size_t
-      max_reject;  // maximum number of records that can be rejected before copy is failed
-  FileType file_type;
-  bool plain_text = false;
-  // s3/parquet related params
-  std::string s3_access_key;  // per-query credentials to override the
-  std::string s3_secret_key;  // settings in ~/.aws/credentials or environment
-  std::string s3_region;
-  std::string s3_endpoint;
-  // kafka related params
-  size_t retry_count;
-  size_t retry_wait;
-  size_t batch_size;
-  size_t buffer_size;
-  // geospatial params
-  bool lonlat;
-  EncodingType geo_coords_encoding;
-  int32_t geo_coords_comp_param;
-  SQLTypes geo_coords_type;
-  int32_t geo_coords_srid;
-  bool sanitize_column_names;
-  std::string geo_layer_name;
-
-  CopyParams()
-      : delimiter(',')
-      , null_str("\\N")
-      , has_header(ImportHeaderRow::AUTODETECT)
-      , quoted(true)
-      , quote('"')
-      , escape('"')
-      , line_delim('\n')
-      , array_delim(',')
-      , array_begin('{')
-      , array_end('}')
-      , threads(0)
-      , max_reject(100000)
-      , file_type(FileType::DELIMITED)
-      , retry_count(100)
-      , retry_wait(5)
-      , batch_size(1000)
-      , buffer_size(kImportFileBufferSize)
-      , lonlat(true)
-      , geo_coords_encoding(kENCODING_GEOINT)
-      , geo_coords_comp_param(32)
-      , geo_coords_type(kGEOMETRY)
-      , geo_coords_srid(4326)
-      , sanitize_column_names(true) {}
-
-  CopyParams(char d, const std::string& n, char l, size_t b, size_t retries, size_t wait)
-      : delimiter(d)
-      , null_str(n)
-      , has_header(ImportHeaderRow::AUTODETECT)
-      , quoted(true)
-      , quote('"')
-      , escape('"')
-      , line_delim(l)
-      , array_delim(',')
-      , array_begin('{')
-      , array_end('}')
-      , threads(0)
-      , max_reject(100000)
-      , file_type(FileType::DELIMITED)
-      , retry_count(retries)
-      , retry_wait(wait)
-      , batch_size(b)
-      , buffer_size(kImportFileBufferSize)
-      , lonlat(true)
-      , geo_coords_encoding(kENCODING_GEOINT)
-      , geo_coords_comp_param(32)
-      , geo_coords_type(kGEOMETRY)
-      , geo_coords_srid(4326)
-      , sanitize_column_names(true) {}
 };
 
 class TypedImportBuffer : boost::noncopyable {
@@ -350,30 +248,7 @@ class TypedImportBuffer : boost::noncopyable {
     string_array_buffer_->push_back(arr);
   }
 
-  void addDictEncodedString(const std::vector<std::string>& string_vec) {
-    CHECK(string_dict_);
-    for (const auto& str : string_vec) {
-      if (str.size() > StringDictionary::MAX_STRLEN) {
-        throw std::runtime_error("String too long for dictionary encoding.");
-      }
-    }
-    switch (column_desc_->columnType.get_size()) {
-      case 1:
-        string_dict_i8_buffer_->resize(string_vec.size());
-        string_dict_->getOrAddBulk(string_vec, string_dict_i8_buffer_->data());
-        break;
-      case 2:
-        string_dict_i16_buffer_->resize(string_vec.size());
-        string_dict_->getOrAddBulk(string_vec, string_dict_i16_buffer_->data());
-        break;
-      case 4:
-        string_dict_i32_buffer_->resize(string_vec.size());
-        string_dict_->getOrAddBulk(string_vec, string_dict_i32_buffer_->data());
-        break;
-      default:
-        CHECK(false);
-    }
-  }
+  void addDictEncodedString(const std::vector<std::string>& string_vec);
 
   void addDictEncodedStringArray(
       const std::vector<std::vector<std::string>>& string_array_vec) {
@@ -634,11 +509,19 @@ class TypedImportBuffer : boost::noncopyable {
 };
 
 class Loader {
+  using LoadCallbackType =
+      std::function<bool(const std::vector<std::unique_ptr<TypedImportBuffer>>&,
+                         std::vector<DataBlockPtr>&,
+                         size_t)>;
+
  public:
-  Loader(Catalog_Namespace::Catalog& c, const TableDescriptor* t)
+  Loader(Catalog_Namespace::Catalog& c,
+         const TableDescriptor* t,
+         LoadCallbackType load_callback = nullptr)
       : catalog_(c)
       , table_desc_(t)
-      , column_descs_(c.getAllColumnMetadataForTable(t->tableId, false, false, true)) {
+      , column_descs_(c.getAllColumnMetadataForTable(t->tableId, false, false, true))
+      , load_callback_(load_callback) {
     init();
   }
 
@@ -671,6 +554,7 @@ class Loader {
 
   void setReplicating(const bool replicating) { replicating_ = replicating; }
   bool getReplicating() const { return replicating_; }
+  void dropColumns(const std::vector<int>& columns);
 
  protected:
   void init();
@@ -690,6 +574,7 @@ class Loader {
   Catalog_Namespace::Catalog& catalog_;
   const TableDescriptor* table_desc_;
   std::list<const ColumnDescriptor*> column_descs_;
+  LoadCallbackType load_callback_;
   Fragmenter_Namespace::InsertData insert_data_;
   std::map<int, StringDictionary*> dict_map_;
 
@@ -811,45 +696,6 @@ class Detector : public DataStreamSink {
 
 class ImporterUtils {
  public:
-  static bool parseStringArray(const std::string& s,
-                               const CopyParams& copy_params,
-                               std::vector<std::string>& string_vec) {
-    if (s == copy_params.null_str || s == "NULL" || s.size() < 1 || s.empty()) {
-      // TODO: should not convert NULL, empty arrays to {"NULL"},
-      //       need to support NULL, empty properly
-      string_vec.emplace_back("NULL");
-      return true;
-    }
-    if (s[0] != copy_params.array_begin || s[s.size() - 1] != copy_params.array_end) {
-      throw std::runtime_error("Malformed Array :" + s);
-    }
-    size_t last = 1;
-    for (size_t i = s.find(copy_params.array_delim, 1); i != std::string::npos;
-         i = s.find(copy_params.array_delim, last)) {
-      if (i > last) {  // if not empty string - disallow empty strings for now
-        if (s.substr(last, i - last).length() > StringDictionary::MAX_STRLEN) {
-          throw std::runtime_error("Array String too long : " +
-                                   std::to_string(s.substr(last, i - last).length()) +
-                                   " max is " +
-                                   std::to_string(StringDictionary::MAX_STRLEN));
-        }
-
-        string_vec.push_back(s.substr(last, i - last));
-      }
-      last = i + 1;
-    }
-    if (s.size() - 1 > last) {  // if not empty string - disallow empty strings for now
-      if (s.substr(last, s.size() - 1 - last).length() > StringDictionary::MAX_STRLEN) {
-        throw std::runtime_error(
-            "Array String too long : " +
-            std::to_string(s.substr(last, s.size() - 1 - last).length()) + " max is " +
-            std::to_string(StringDictionary::MAX_STRLEN));
-      }
-
-      string_vec.push_back(s.substr(last, s.size() - 1 - last));
-    }
-    return false;
-  }
   static ArrayDatum composeNullArray(const SQLTypeInfo& ti);
 };
 
@@ -973,17 +819,9 @@ class Importer : public DataStreamSink {
   static std::mutex init_gdal_mutex;
 };
 
-class ImportDriver : public QueryRunner::QueryRunner {
- public:
-  ImportDriver(std::shared_ptr<Catalog_Namespace::Catalog> cat,
-               const Catalog_Namespace::UserMetadata& user,
-               const ExecutorDeviceType dt = ExecutorDeviceType::GPU);
-
-  void importGeoTable(const std::string& file_path,
-                      const std::string& table_name,
-                      const bool compression = true,
-                      const bool create_table = true);
-};
+std::vector<std::unique_ptr<TypedImportBuffer>> setup_column_loaders(
+    const TableDescriptor* td,
+    Loader* loader);
 
 }  // namespace Importer_NS
 

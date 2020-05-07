@@ -26,6 +26,8 @@
 
 #include <algorithm>
 #include <iomanip>
+#include <string_view>
+#include <unordered_map>
 
 namespace query_state {
 
@@ -70,10 +72,6 @@ QueryStateProxy QueryState::createQueryStateProxy(Events::iterator parent) {
 Timer QueryState::createTimer(char const* event_name, Events::iterator parent) {
   std::lock_guard<std::mutex> lock(events_mutex_);
   return Timer(shared_from_this(), events_.emplace(events_.end(), event_name, parent));
-}
-
-SessionData const* QueryState::get_session_data() const {
-  return boost::get_pointer(session_data_);
 }
 
 std::shared_ptr<Catalog_Namespace::SessionInfo const> QueryState::getConstSessionInfo()
@@ -138,25 +136,59 @@ std::shared_ptr<Catalog_Namespace::SessionInfo> StdLog::getSessionInfo() const {
   return session_info_;
 }
 
-// Wrapper for logging SessionInfo
+struct QuoteFormatter {
+  std::string const& str;
+};
+
+std::ostream& operator<<(std::ostream& os, QuoteFormatter const& quote_formatter) {
+  if (quote_formatter.str.find_first_of(" \"") == std::string::npos) {
+    return os << quote_formatter.str;
+  } else {
+    return os << std::quoted(quote_formatter.str, '"', '"');
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, SessionData const& session_data) {
+  return os << QuoteFormatter{session_data.db_name} << ' '
+            << QuoteFormatter{session_data.user_name} << ' '
+            << session_data.public_session_id;
+}
+
 struct SessionInfoFormatter {
   Catalog_Namespace::SessionInfo const& session_info;
 };
 
 std::ostream& operator<<(std::ostream& os, SessionInfoFormatter const& formatter) {
-  auto const& db_name = formatter.session_info.getCatalog().getCurrentDB().dbName;
-  if (db_name.find_first_of(" \"") == std::string::npos) {
-    os << db_name;
-  } else {
-    os << std::quoted(db_name, '"', '"');
-  }
-  auto const& userName = formatter.session_info.get_currentUser().userName;
-  if (userName.find_first_of(" \"") == std::string::npos) {
-    os << ' ' << userName;
-  } else {
-    os << ' ' << std::quoted(userName, '"', '"');
-  }
-  return os << ' ' << formatter.session_info.get_public_session_id();
+  return os << QuoteFormatter{formatter.session_info.getCatalog().getCurrentDB().dbName}
+            << ' ' << QuoteFormatter{formatter.session_info.get_currentUser().userName}
+            << ' ' << formatter.session_info.get_public_session_id();
+}
+
+// Default severity for logging stdlog_begin lines is DEBUG1.
+// Some functions, such as sql_execute, log them at INFO level.
+logger::Severity StdLog::stdlogBeginSeverity(char const* func) {
+  logger::Severity const defaultSeverity = logger::Severity::DEBUG1;
+  static std::unordered_map<std::string_view, logger::Severity> const map{
+      {"connect", logger::Severity::INFO},
+      {"disconnect", logger::Severity::INFO},
+      {"switch_database", logger::Severity::INFO},
+      {"clone_session", logger::Severity::INFO},
+      {"get_tables_meta", logger::Severity::INFO},
+      {"get_table_details", logger::Severity::INFO},
+      {"sql_execute", logger::Severity::INFO},
+      {"sql_execute_df", logger::Severity::INFO},
+      {"sql_execute_gdf", logger::Severity::INFO},
+      {"sql_validate", logger::Severity::INFO},
+      {"render_vega", logger::Severity::INFO},
+      {"get_result_row_for_pixel", logger::Severity::INFO},
+      {"check_table_consistency", logger::Severity::INFO},
+      {"start_query", logger::Severity::INFO},
+      {"execute_query_step", logger::Severity::INFO},
+      {"broadcast_serialized_rows", logger::Severity::INFO},
+      {"start_render_query", logger::Severity::INFO},
+      {"execute_next_render_step", logger::Severity::INFO}};
+  auto const itr = map.find(func);
+  return itr == map.cend() ? defaultSeverity : itr->second;
 }
 
 void StdLog::log(logger::Severity severity, char const* label) {
@@ -166,23 +198,24 @@ void StdLog::log(logger::Severity severity, char const* label) {
        << duration<std::chrono::milliseconds>() << ' ';
     if (session_info_) {
       ss << SessionInfoFormatter{*session_info_} << ' ';
+    } else if (query_state_ && query_state_->getSessionData()) {
+      ss << *query_state_->getSessionData() << ' ';
     } else {
       ss << "   ";  // 3 spaces for 3 empty strings
     }
     auto const& nv = name_value_pairs_;
-    if (nv.empty() && (!query_state_ || query_state_->empty_log())) {
+    if (nv.empty() && (!query_state_ || query_state_->emptyLog())) {
       ss << ' ';  // 1 space for final empty names/values arrays
     } else {
       // All values are logged after all names, so separate values stream is needed.
       std::stringstream values;
       unsigned nvalues = 0;
-      if (query_state_ && !query_state_->get_query_str().empty()) {
+      if (query_state_ && !query_state_->getQueryStr().empty()) {
         ss << (nvalues ? ',' : '{') << std::quoted("query_str", '"', '"');
         values << (nvalues++ ? ',' : '{')
-               << std::quoted(
-                      hide_sensitive_data_from_query(query_state_->get_query_str()),
-                      '"',
-                      '"');
+               << std::quoted(hide_sensitive_data_from_query(query_state_->getQueryStr()),
+                              '"',
+                              '"');
       }
       for (auto itr = nv.cbegin(); itr != nv.cend(); ++itr) {
         ss << (nvalues ? ',' : '{') << std::quoted(*itr, '"', '"');
@@ -208,7 +241,7 @@ StdLog::~StdLog() {
   log(logger::Severity::INFO, "stdlog");
   logCallStack(logger::Severity::DEBUG1, "stacked_times");
   if (query_state_) {
-    query_state_->set_logged(true);
+    query_state_->setLogged(true);
   }
   if (session_info_) {
     session_info_->update_last_used_time();

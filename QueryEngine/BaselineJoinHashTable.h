@@ -42,13 +42,14 @@ class Executor;
 // now, such tuples must be unique within the inner table.
 class BaselineJoinHashTable : public JoinHashTableInterface {
  public:
+  //! Make hash table from an in-flight SQL query's parse tree etc.
   static std::shared_ptr<BaselineJoinHashTable> getInstance(
       const std::shared_ptr<Analyzer::BinOper> condition,
       const std::vector<InputTableInfo>& query_infos,
       const Data_Namespace::MemoryLevel memory_level,
       const HashType preferred_hash_type,
       const int device_count,
-      ColumnCacheMap& column_map,
+      ColumnCacheMap& column_cache,
       Executor* executor);
 
   static size_t getShardCountForCondition(
@@ -57,7 +58,17 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
       const std::vector<InnerOuter>& inner_outer_pairs);
 
   int64_t getJoinHashBuffer(const ExecutorDeviceType device_type,
-                            const int device_id) noexcept override;
+                            const int device_id) const noexcept override;
+
+  size_t getJoinHashBufferSize(const ExecutorDeviceType device_type,
+                               const int device_id) const noexcept override;
+
+  std::string toString(const ExecutorDeviceType device_type,
+                       const int device_id = 0,
+                       bool raw = false) const override;
+
+  std::set<DecodedJoinHashBufferEntry> toSet(const ExecutorDeviceType device_type,
+                                             const int device_id) const override;
 
   llvm::Value* codegenSlot(const CompilationOptions&, const size_t) override;
 
@@ -70,6 +81,12 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 
   JoinHashTableInterface::HashType getHashType() const noexcept override;
 
+  Data_Namespace::MemoryLevel getMemoryLevel() const noexcept override {
+    return memory_level_;
+  };
+
+  int getDeviceCount() const noexcept override { return device_count_; };
+
   size_t offsetBufferOff() const noexcept override;
 
   size_t countBufferOff() const noexcept override;
@@ -77,15 +94,36 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
   size_t payloadBufferOff() const noexcept override;
 
   static auto yieldCacheInvalidator() -> std::function<void()> {
+    VLOG(1) << "Invalidate " << hash_table_cache_.size() << " cached baseline hashtable.";
     return []() -> void {
       std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
       hash_table_cache_.clear();
     };
   }
 
+  static const std::shared_ptr<std::vector<int8_t>>& getCachedHashTable(size_t idx) {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    CHECK(!hash_table_cache_.empty());
+    CHECK_LT(idx, hash_table_cache_.size());
+    return hash_table_cache_.at(idx).second.buffer;
+  }
+
+  static size_t getEntryCntCachedHashTable(size_t idx) {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    CHECK(!hash_table_cache_.empty());
+    CHECK_LT(idx, hash_table_cache_.size());
+    return hash_table_cache_.at(idx).second.entry_count;
+  }
+
+  static uint64_t getNumberOfCachedHashTables() {
+    std::lock_guard<std::mutex> guard(hash_table_cache_mutex_);
+    return hash_table_cache_.size();
+  }
+
   virtual ~BaselineJoinHashTable() {}
 
  private:
+  size_t getKeyBufferSize() const noexcept;
   size_t getComponentBufferSize() const noexcept;
 
  protected:
@@ -94,25 +132,27 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
                         const Data_Namespace::MemoryLevel memory_level,
                         const HashType preferred_hash_type,
                         const size_t entry_count,
-                        ColumnCacheMap& column_map,
+                        ColumnCacheMap& column_cache,
                         Executor* executor,
-                        const std::vector<InnerOuter>& inner_outer_pairs);
+                        const std::vector<InnerOuter>& inner_outer_pairs,
+                        const int device_count);
 
   static int getInnerTableId(const std::vector<InnerOuter>& inner_outer_pairs);
 
-  virtual void reifyWithLayout(const int device_count,
-                               const JoinHashTableInterface::HashType layout);
+  virtual void reifyWithLayout(const JoinHashTableInterface::HashType layout);
 
   struct ColumnsForDevice {
     const std::vector<JoinColumn> join_columns;
     const std::vector<JoinColumnTypeInfo> join_column_types;
     const std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks_owner;
     const std::vector<JoinBucketInfo> join_buckets;
+    const std::vector<std::shared_ptr<void>> malloc_owner;
   };
 
   virtual ColumnsForDevice fetchColumnsForDevice(
       const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-      const int device_id);
+      const int device_id,
+      ThrustAllocator& dev_buff_owner);
 
   virtual std::pair<size_t, size_t> approximateTupleCount(
       const std::vector<ColumnsForDevice>&) const;
@@ -136,11 +176,6 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 
   virtual llvm::Value* codegenKey(const CompilationOptions&);
 
-  std::pair<const int8_t*, size_t> getAllColumnFragments(
-      const Analyzer::ColumnVar& hash_col,
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-      std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner);
-
   size_t shardCount() const;
 
   Data_Namespace::MemoryLevel getEffectiveMemoryLevel(
@@ -154,17 +189,12 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 
   CompositeKeyInfo getCompositeKeyInfo() const;
 
-  void reify(const int device_count);
-
-  JoinColumn fetchColumn(const Analyzer::ColumnVar* inner_col,
-                         const Data_Namespace::MemoryLevel& effective_memory_level,
-                         const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
-                         std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner,
-                         const int device_id);
+  void reify();
 
   void reifyForDevice(const ColumnsForDevice& columns_for_device,
                       const JoinHashTableInterface::HashType layout,
-                      const int device_id);
+                      const int device_id,
+                      const logger::ThreadId parent_thread_id);
 
   void checkHashJoinReplicationConstraint(const int table_id) const;
 
@@ -224,6 +254,12 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
   void freeHashBufferGpuMemory();
   void freeHashBufferCpuMemory();
 
+  bool layoutRequiresAdditionalBuffers(JoinHashTableInterface::HashType layout) const
+      noexcept override {
+    return (layout == JoinHashTableInterface::HashType::ManyToMany ||
+            layout == JoinHashTableInterface::HashType::OneToMany);
+  };
+
   const std::shared_ptr<Analyzer::BinOper> condition_;
   const std::vector<InputTableInfo>& query_infos_;
   const Data_Namespace::MemoryLevel memory_level_;
@@ -237,13 +273,9 @@ class BaselineJoinHashTable : public JoinHashTableInterface {
 #ifdef HAVE_CUDA
   std::vector<Data_Namespace::AbstractBuffer*> gpu_hash_table_buff_;
 #endif
-  typedef std::pair<const int8_t*, size_t> LinearizedColumn;
-  typedef std::pair<int, int> LinearizedColumnCacheKey;
-  std::map<LinearizedColumnCacheKey, LinearizedColumn> linearized_multifrag_columns_;
-  std::mutex linearized_multifrag_column_mutex_;
-  RowSetMemoryOwner linearized_multifrag_column_owner_;
   std::vector<InnerOuter> inner_outer_pairs_;
   const Catalog_Namespace::Catalog* catalog_;
+  const int device_count_;
 #ifdef HAVE_CUDA
   unsigned block_size_;
   unsigned grid_size_;

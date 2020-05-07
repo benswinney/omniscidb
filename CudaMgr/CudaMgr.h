@@ -13,44 +13,60 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#ifndef CUDAMGR_H
-#define CUDAMGR_H
+#pragma once
 
 #include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "Shared/Logger.h"
+#include "Shared/uuid.h"
+
 #ifdef HAVE_CUDA
 #include <cuda.h>
 #else
-#include "../Shared/nocuda.h"
+#include "Shared/nocuda.h"
 #endif  // HAVE_CUDA
+
+namespace omnisci {
+struct DeviceIdentifier {
+  const int index;    //!< index into device group (currently num_gpus - start_gpu)
+  const int cuda_id;  //!< Cuda ID for device (ignores start_gpu)
+  const UUID uuid;    //!< UUID for device (hardware invariant)
+};
+
+using DeviceGroup = std::vector<DeviceIdentifier>;
+}  // namespace omnisci
 
 namespace CudaMgr_Namespace {
 
+enum class NvidiaDeviceArch {
+  Kepler,   // compute major = 3
+  Maxwell,  // compute major = 5
+  Pascal,   // compute major = 6
+  Volta,    // compute major = 7, compute minor = 0
+  Turing    // compute major = 7, compute minor = 5
+};
+
 #ifdef HAVE_CUDA
+std::string errorMessage(CUresult const);
+
 class CudaErrorException : public std::runtime_error {
  public:
   CudaErrorException(CUresult status)
-      : std::runtime_error(processStatus(status)), status_(status) {}
+      : std::runtime_error(errorMessage(status)), status_(status) {}
 
   CUresult getStatus() const { return status_; }
 
  private:
-  CUresult status_;
-  std::string processStatus(CUresult status) {
-    const char* errorString{nullptr};
-    cuGetErrorString(status, &errorString);
-    return errorString
-               ? "CUDA Error: " + std::string(errorString)
-               : std::string("CUDA Driver API error code ") + std::to_string(status);
-  }
+  CUresult const status_;
 };
 #endif
 
 struct DeviceProperties {
   CUdevice device;
+  omnisci::UUID uuid;
   int computeMajor;
   int computeMinor;
   size_t globalMem;
@@ -69,7 +85,6 @@ struct DeviceProperties {
   float memoryBandwidthGBs;
   int clockKhz;
   int numCore;
-  std::string arch;
 };
 
 class CudaMgr {
@@ -79,6 +94,8 @@ class CudaMgr {
 
   void synchronizeDevices() const;
   int getDeviceCount() const { return device_count_; }
+  int getStartGpu() const { return start_gpu_; }
+  const omnisci::DeviceGroup& getDeviceGroup() const { return device_group_; }
 
   void copyHostToDevice(int8_t* device_ptr,
                         const int8_t* host_ptr,
@@ -104,7 +121,6 @@ class CudaMgr {
                     const size_t num_bytes,
                     const int device_num);
 
-  int getStartGpu() const { return start_gpu_; }
   size_t getMaxSharedMemoryForAll() const { return max_shared_memory_for_all_; }
 
   const std::vector<DeviceProperties>& getAllDeviceProperties() const {
@@ -135,9 +151,57 @@ class CudaMgr {
   bool isArchMaxwellOrLaterForAll() const;
   bool isArchVoltaForAll() const;
 
+  static std::string deviceArchToSM(const NvidiaDeviceArch arch) {
+    // Must match ${CUDA_COMPILATION_ARCH} CMAKE flag
+    switch (arch) {
+      case NvidiaDeviceArch::Kepler:
+        return "sm_30";
+      case NvidiaDeviceArch::Maxwell:
+        return "sm_50";
+      case NvidiaDeviceArch::Pascal:
+        return "sm_60";
+      case NvidiaDeviceArch::Volta:
+        return "sm_70";
+      case NvidiaDeviceArch::Turing:
+        return "sm_75";
+      default:
+        LOG(WARNING) << "Unrecognized Nvidia device architecture, falling back to "
+                        "Kepler-compatibility.";
+        return "sm_30";
+    }
+    UNREACHABLE();
+    return "";
+  }
+
+  NvidiaDeviceArch getDeviceArch() const {
+    if (device_properties_.size() > 0) {
+      const auto& device_properties = device_properties_.front();
+      switch (device_properties.computeMajor) {
+        case 3:
+          return NvidiaDeviceArch::Kepler;
+        case 5:
+          return NvidiaDeviceArch::Maxwell;
+        case 6:
+          return NvidiaDeviceArch::Pascal;
+        case 7:
+          if (device_properties.computeMinor == 0) {
+            return NvidiaDeviceArch::Volta;
+          } else {
+            return NvidiaDeviceArch::Turing;
+          }
+        default:
+          return NvidiaDeviceArch::Kepler;
+      }
+    } else {
+      // always fallback to Kepler if an architecture cannot be detected
+      return NvidiaDeviceArch::Kepler;
+    }
+  }
+
   void setContext(const int device_num) const;
 
 #ifdef HAVE_CUDA
+
   void printDeviceProperties() const;
 
   const std::vector<CUcontext>& getDeviceContexts() const { return device_contexts_; }
@@ -150,26 +214,34 @@ class CudaMgr {
                          void** option_values,
                          const int device_id) const;
   void unloadGpuModuleData(CUmodule* module, const int device_id) const;
+
+  struct CudaMemoryUsage {
+    size_t free;   // available GPU RAM memory on active card in bytes
+    size_t total;  // total GPU RAM memory on active card in bytes
+  };
+
+  static CudaMemoryUsage getCudaMemoryUsage();
 #endif
 
  private:
 #ifdef HAVE_CUDA
   void fillDeviceProperties();
+  void initDeviceGroup();
   void createDeviceContexts();
   size_t computeMaxSharedMemoryForAll() const;
   void checkError(CUresult cu_result) const;
+
+  int gpu_driver_version_;
 #endif
 
   int device_count_;
-  int gpu_driver_version_;
   int start_gpu_;
   size_t max_shared_memory_for_all_;
   std::vector<DeviceProperties> device_properties_;
+  omnisci::DeviceGroup device_group_;
   std::vector<CUcontext> device_contexts_;
 
   mutable std::mutex device_cleanup_mutex_;
 };
 
 }  // Namespace CudaMgr_Namespace
-
-#endif  // CUDAMGR_H

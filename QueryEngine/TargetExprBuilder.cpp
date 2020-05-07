@@ -63,6 +63,8 @@ std::vector<std::string> agg_fn_base_names(const TargetInfo& target_info) {
       return {"agg_sum"};
     case kAPPROX_COUNT_DISTINCT:
       return {"agg_approximate_count_distinct"};
+    case kSINGLE_VALUE:
+      return {"checked_single_agg_id"};
     case kSAMPLE:
       return {"agg_id"};
     default:
@@ -83,6 +85,7 @@ void TargetExprCodegen::codegen(
     Executor* executor,
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co,
+    const GpuSharedMemoryContext& gpu_smem_context,
     const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx_in,
     const std::vector<llvm::Value*>& agg_out_vec,
     llvm::Value* output_buffer_byte_stream,
@@ -165,7 +168,7 @@ void TargetExprCodegen::codegen(
   uint32_t col_off{0};
   const bool is_simple_count =
       target_info.is_agg && target_info.agg_kind == kCOUNT && !target_info.is_distinct;
-  if (co.device_type_ == ExecutorDeviceType::GPU && query_mem_desc.threadsShareMemory() &&
+  if (co.device_type == ExecutorDeviceType::GPU && query_mem_desc.threadsShareMemory() &&
       is_simple_count && (!arg_expr || arg_expr->get_type_info().get_notnull())) {
     CHECK_EQ(size_t(1), agg_fn_names.size());
     const auto chosen_bytes = query_mem_desc.getPaddedSlotWidthBytes(slot_index);
@@ -201,14 +204,23 @@ void TargetExprCodegen::codegen(
         const auto acc_i64 = LL_BUILDER.CreateBitCast(
             is_group_by ? agg_col_ptr : agg_out_vec[slot_index],
             llvm::PointerType::get(get_int_type(64, LL_CONTEXT), 0));
-        LL_BUILDER.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
-                                   acc_i64,
-                                   LL_INT(int64_t(1)),
-                                   llvm::AtomicOrdering::Monotonic);
+        if (gpu_smem_context.isSharedMemoryUsed()) {
+          group_by_and_agg->emitCall(
+              "agg_count_shared", std::vector<llvm::Value*>{acc_i64, LL_INT(int64_t(1))});
+        } else {
+          LL_BUILDER.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
+                                     acc_i64,
+                                     LL_INT(int64_t(1)),
+                                     llvm::AtomicOrdering::Monotonic);
+        }
       } else {
-        const auto acc_i32 = LL_BUILDER.CreateBitCast(
+        auto acc_i32 = LL_BUILDER.CreateBitCast(
             is_group_by ? agg_col_ptr : agg_out_vec[slot_index],
             llvm::PointerType::get(get_int_type(32, LL_CONTEXT), 0));
+        if (gpu_smem_context.isSharedMemoryUsed()) {
+          acc_i32 = LL_BUILDER.CreatePointerCast(
+              acc_i32, llvm::Type::getInt32PtrTy(LL_CONTEXT, 3));
+        }
         LL_BUILDER.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
                                    acc_i32,
                                    LL_INT(1),
@@ -216,8 +228,7 @@ void TargetExprCodegen::codegen(
       }
     } else {
       const auto acc_i32 = (is_group_by ? agg_col_ptr : agg_out_vec[slot_index]);
-      if (query_mem_desc.getGpuMemSharing() ==
-          GroupByMemSharing::SharedForKeylessOneColumnKnownRange) {
+      if (gpu_smem_context.isSharedMemoryUsed()) {
         // Atomic operation on address space level 3 (Shared):
         const auto shared_acc_i32 = LL_BUILDER.CreatePointerCast(
             acc_i32, llvm::Type::getInt32PtrTy(LL_CONTEXT, 3));
@@ -353,11 +364,15 @@ void TargetExprCodegen::codegen(
       CHECK_EQ(agg_chosen_bytes, sizeof(int64_t));
       CHECK(!chosen_type.is_fp());
       group_by_and_agg->codegenCountDistinct(
-          target_idx, target_expr, agg_args, query_mem_desc, co.device_type_);
+          target_idx, target_expr, agg_args, query_mem_desc, co.device_type);
     } else {
       const auto& arg_ti = target_info.agg_arg_type;
       if (need_skip_null && !arg_ti.is_geometry()) {
         agg_fname += "_skip_val";
+      }
+
+      if (target_info.agg_kind == kSINGLE_VALUE ||
+          (need_skip_null && !arg_ti.is_geometry())) {
         llvm::Value* null_in_lv{nullptr};
         if (arg_ti.is_fp()) {
           null_in_lv =
@@ -374,14 +389,18 @@ void TargetExprCodegen::codegen(
         agg_args.push_back(null_lv);
       }
       if (!target_info.is_distinct) {
-        if (co.device_type_ == ExecutorDeviceType::GPU &&
+        if (co.device_type == ExecutorDeviceType::GPU &&
             query_mem_desc.threadsShareMemory()) {
           agg_fname += "_shared";
           if (needs_unnest_double_patch) {
             agg_fname = patch_agg_fname(agg_fname);
           }
         }
-        group_by_and_agg->emitCall(agg_fname, agg_args);
+        auto agg_fname_call_ret_lv = group_by_and_agg->emitCall(agg_fname, agg_args);
+
+        if (agg_fname.find("checked") != std::string::npos) {
+          group_by_and_agg->checkErrorCode(agg_fname_call_ret_lv);
+        }
       }
     }
     if (window_func && window_function_requires_peer_handling(window_func)) {
@@ -456,7 +475,7 @@ void TargetExprCodegenBuilder::operator()(const Analyzer::Expr* target_expr,
   auto target_info = get_target_info(target_expr, g_bigint_count);
   auto arg_expr = agg_arg(target_expr);
   if (arg_expr) {
-    if (target_info.agg_kind == kSAMPLE) {
+    if (target_info.agg_kind == kSINGLE_VALUE || target_info.agg_kind == kSAMPLE) {
       target_info.skip_null_val = false;
     } else if (query_mem_desc.getQueryDescriptionType() ==
                    QueryDescriptionType::NonGroupedAggregate &&
@@ -471,7 +490,7 @@ void TargetExprCodegenBuilder::operator()(const Analyzer::Expr* target_expr,
 
   if (!(query_mem_desc.getQueryDescriptionType() ==
         QueryDescriptionType::NonGroupedAggregate) &&
-      (co.device_type_ == ExecutorDeviceType::GPU) && target_info.is_agg &&
+      (co.device_type == ExecutorDeviceType::GPU) && target_info.is_agg &&
       (target_info.agg_kind == kSAMPLE)) {
     sample_exprs_to_codegen.emplace_back(target_expr,
                                          target_info,
@@ -512,6 +531,7 @@ void TargetExprCodegenBuilder::codegen(
     Executor* executor,
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co,
+    const GpuSharedMemoryContext& gpu_smem_context,
     const std::tuple<llvm::Value*, llvm::Value*>& agg_out_ptr_w_idx,
     const std::vector<llvm::Value*>& agg_out_vec,
     llvm::Value* output_buffer_byte_stream,
@@ -525,6 +545,7 @@ void TargetExprCodegenBuilder::codegen(
                                 executor,
                                 query_mem_desc,
                                 co,
+                                gpu_smem_context,
                                 agg_out_ptr_w_idx,
                                 agg_out_vec,
                                 output_buffer_byte_stream,
@@ -555,7 +576,7 @@ void TargetExprCodegenBuilder::codegenSampleExpressions(
     llvm::Value* out_row_idx,
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
   CHECK(!sample_exprs_to_codegen.empty());
-  CHECK(co.device_type_ == ExecutorDeviceType::GPU);
+  CHECK(co.device_type == ExecutorDeviceType::GPU);
   if (sample_exprs_to_codegen.size() == 1 &&
       !sample_exprs_to_codegen.front().target_info.sql_type.is_varlen()) {
     codegenSingleSlotSampleExpression(group_by_and_agg,
@@ -592,12 +613,13 @@ void TargetExprCodegenBuilder::codegenSingleSlotSampleExpression(
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
   CHECK_EQ(size_t(1), sample_exprs_to_codegen.size());
   CHECK(!sample_exprs_to_codegen.front().target_info.sql_type.is_varlen());
-  CHECK(co.device_type_ == ExecutorDeviceType::GPU);
+  CHECK(co.device_type == ExecutorDeviceType::GPU);
   // no need for the atomic if we only have one SAMPLE target
   sample_exprs_to_codegen.front().codegen(group_by_and_agg,
                                           executor,
                                           query_mem_desc,
                                           co,
+                                          {},
                                           agg_out_ptr_w_idx,
                                           agg_out_vec,
                                           output_buffer_byte_stream,
@@ -617,7 +639,7 @@ void TargetExprCodegenBuilder::codegenMultiSlotSampleExpressions(
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
   CHECK(sample_exprs_to_codegen.size() > 1 ||
         sample_exprs_to_codegen.front().target_info.sql_type.is_varlen());
-  CHECK(co.device_type_ == ExecutorDeviceType::GPU);
+  CHECK(co.device_type == ExecutorDeviceType::GPU);
   const auto& first_sample_expr = sample_exprs_to_codegen.front();
   auto target_lvs = group_by_and_agg->codegenAggArg(first_sample_expr.target_expr, co);
   CHECK_GE(target_lvs.size(), size_t(1));
@@ -655,6 +677,7 @@ void TargetExprCodegenBuilder::codegenMultiSlotSampleExpressions(
                                 executor,
                                 query_mem_desc,
                                 co,
+                                {},
                                 agg_out_ptr_w_idx,
                                 agg_out_vec,
                                 output_buffer_byte_stream,

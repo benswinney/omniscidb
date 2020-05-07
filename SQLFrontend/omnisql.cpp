@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
 
@@ -55,7 +56,7 @@
 #include "Shared/base64.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/mapd_shared_ptr.h"
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/OmniSci.h"
 
 #include "linenoise.h"
 
@@ -74,6 +75,10 @@ const std::string OmniSQLRelease(MAPD_RELEASE);
 namespace {
 
 ClientContext* g_client_context_ptr{nullptr};
+// global session is used to classify a session to deal with user's request on
+// query execution and other services that thrift creates a new session ID
+// i.e., global_session is a parent session of {service_session_1, ..., service_session_N}
+static std::string global_session{""};
 
 void completion(const char* buf, linenoiseCompletions* lc) {
   CHECK(g_client_context_ptr);
@@ -139,7 +144,7 @@ void copy_table(char const* filepath, char const* table, ClientContext& context)
       if (input_rows.size() >= LOAD_PATCH_SIZE) {
         try {
           context.client.load_table(context.session, table, input_rows);
-        } catch (TMapDException& e) {
+        } catch (TOmniSciException& e) {
           std::cerr << e.error_msg << std::endl;
         }
         input_rows.clear();
@@ -148,7 +153,7 @@ void copy_table(char const* filepath, char const* table, ClientContext& context)
     if (input_rows.size() > 0) {
       context.client.load_table(context.session, table, input_rows);
     }
-  } catch (TMapDException& e) {
+  } catch (TOmniSciException& e) {
     std::cerr << e.error_msg << std::endl;
   } catch (TException& te) {
     std::cerr << "Thrift error: " << te.what() << std::endl;
@@ -167,16 +172,16 @@ void detect_table(char* file_name, TCopyParams& copy_params, ClientContext& cont
     context.client.detect_column_types(_return, context.session, file_name, copy_params);
     // print result only for verifying detect_column_types api
     // as this cmd seems never planned for public use
-    for (const auto tct : _return.row_set.row_desc) {
+    for (const auto& tct : _return.row_set.row_desc) {
       printf("%20.20s ", tct.col_name.c_str());
     }
     printf("\n");
-    for (const auto tct : _return.row_set.row_desc) {
+    for (const auto& tct : _return.row_set.row_desc) {
       printf("%20.20s ", type_info_from_thrift(tct.col_type).get_type_name().c_str());
     }
     printf("\n");
-    for (const auto row : _return.row_set.rows) {
-      for (const auto col : row.cols) {
+    for (const auto& row : _return.row_set.rows) {
+      for (const auto& col : row.cols) {
         printf("%20.20s ", col.val.str_val.c_str());
       }
       printf("\n");
@@ -201,7 +206,7 @@ void detect_table(char* file_name, TCopyParams& copy_params, ClientContext& cont
     }
     oss << ");";
     printf("\n%s\n", oss.str().c_str());
-  } catch (TMapDException& e) {
+  } catch (TOmniSciException& e) {
     std::cerr << e.error_msg << std::endl;
   } catch (TException& te) {
     std::cerr << "Thrift error in detect_table: " << te.what() << std::endl;
@@ -602,7 +607,7 @@ bool backchannel(int action, ClientContext* cc, const std::string& ccn = "") {
           context->server_host, context->port, ca_cert_name);
       protocol2 = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport2));
     }
-    MapDClient c2(protocol2);
+    OmniSciClient c2(protocol2);
     ClientContext context2(*transport2, c2);
 
     context2.db_name = context->db_name;
@@ -620,7 +625,7 @@ bool backchannel(int action, ClientContext* cc, const std::string& ccn = "") {
     (void)thrift_with_retry(kCONNECT, context2, nullptr);
 
     std::cout << "Asking server to interrupt query.\n" << std::flush;
-    (void)thrift_with_retry(kINTERRUPT, context2, nullptr);
+    (void)thrift_with_retry(kINTERRUPT, context2, nullptr, 1, global_session);
 
     if (context2.session != INVALID_SESSION_ID) {
       (void)thrift_with_retry(kDISCONNECT, context2, nullptr);
@@ -845,78 +850,123 @@ void print_all_hardware_info(ClientContext& context) {
   std::cout << tss.str();
 }
 
-static void print_privs(const std::vector<bool>& privs, TDBObjectType::type type) {
+static std::vector<std::string> stringify_privs(const std::vector<bool>& priv_mask,
+                                                TDBObjectType::type type) {
   // Client priviliges print lookup
+  std::vector<std::string> priv_strs;
   static const std::unordered_map<const TDBObjectType::type,
                                   const std::vector<std::string>>
       privilege_names_lookup{
           {TDBObjectType::DatabaseDBObjectType,
-           {" create"s, " drop"s, " view-sql-editor"s, " login-access"s}},
+           {"create"s, "drop"s, "view-sql-editor"s, "login-access"s}},
           {TDBObjectType::TableDBObjectType,
-           {" create"s,
-            " drop"s,
-            " select"s,
-            " insert"s,
-            " update"s,
-            " delete"s,
-            " truncate"s,
-            " alter"s}},
+           {"create"s,
+            "drop"s,
+            "select"s,
+            "insert"s,
+            "update"s,
+            "delete"s,
+            "truncate"s,
+            "alter"s}},
           {TDBObjectType::DashboardDBObjectType,
-           {" create"s, " delete"s, " view"s, " edit"s}},
+           {"create"s, "delete"s, "view"s, "edit"s}},
           {TDBObjectType::ViewDBObjectType,
-           {" create"s, " drop"s, " select"s, " insert"s, " update"s, " delete"s}}};
+           {"create"s, "drop"s, "select"s, "insert"s, "update"s, "delete"s}}};
 
   const auto privilege_names = privilege_names_lookup.find(type);
-  size_t i = 0;
+
   if (privilege_names != privilege_names_lookup.end()) {
-    for (const auto& priv : privs) {
-      if (priv) {
-        std::cout << privilege_names->second[i];
-      }
-      ++i;
-    }
+    size_t i = 0;
+    const auto& priv_names = privilege_names->second;
+    std::copy_if(priv_names.begin(),
+                 priv_names.end(),
+                 std::back_inserter(priv_strs),
+                 [&priv_mask, &i](std::string const& s) { return priv_mask.at(i++); });
   }
+  return priv_strs;
 }
+
+namespace {
+const size_t priv_col_width = 20;
+
+struct PrivilegeRow {
+  std::string object_name;
+  std::string object_type;
+  std::string privilege_object_type;
+  std::vector<std::string> privileges;
+};
+
+std::ostream& operator<<(std::ostream& os, const PrivilegeRow& priv_row) {
+  os << std::setw(priv_col_width) << priv_row.object_name;
+  os << std::setw(priv_col_width) << priv_row.object_type;
+  os << std::setw(priv_col_width) << priv_row.privilege_object_type;
+  os << boost::algorithm::join(priv_row.privileges, ", ");
+  return os;
+};
+
+}  // namespace
 
 void get_db_objects_for_grantee(ClientContext& context) {
   context.db_objects.clear();
+  std::ostringstream tss;
+  tss << std::left << std::setfill(' ');
+
+  // NOTE(jclay): At some point, we may want to pull these up into
+  // a utility for use in omnisql that allows us to easily format and write out tables.
+  auto write_table_header = [&tss](auto headers) -> void {
+    for (const auto& h : headers) {
+      tss << std::setw(priv_col_width);
+      tss << h;
+    }
+    tss << std::endl;
+    tss << std::string(tss.str().length(), '-') << std::endl;
+  };
+
+  auto write_table_rows = [&tss](std::vector<PrivilegeRow> rows) -> void {
+    std::sort(
+        rows.begin(), rows.end(), [](const PrivilegeRow& lhs, const PrivilegeRow& rhs) {
+          return lhs.object_type < rhs.object_type;
+        });
+
+    tss.width(priv_col_width);
+    for (const auto& r : rows) {
+      tss << r;
+      tss << std::endl;
+    }
+    std::cout << tss.str() << std::endl;
+  };
+
+  const std::string object_names[4] = {"database", "table", "dashboard", "view"};
+  auto type_to_string = [&](TDBObjectType::type type) -> std::string {
+    const int type_val = static_cast<int>(type);
+    CHECK(type_val > 0 && type_val < 5);
+    return object_names[type_val - 1];
+  };
+
+  const std::vector<std::string> headers = {
+      "ObjectName", "ObjectType", "PrivilegeType", "Privileges"};
+  write_table_header(headers);
   if (thrift_with_retry(kGET_OBJECTS_FOR_GRANTEE, context, nullptr)) {
+    std::vector<PrivilegeRow> table_values;
     for (const auto& db_object : context.db_objects) {
-      bool any_granted_privs = false;
-      for (size_t j = 0; j < db_object.privs.size(); j++) {
-        if (db_object.privs[j]) {
-          any_granted_privs = true;
-          break;
-        }
-      }
-      if (!any_granted_privs) {
+      PrivilegeRow out_row;
+
+      auto has_granted_privs = [](const std::vector<bool>& privs_mask) -> const bool {
+        return std::accumulate(privs_mask.begin(), privs_mask.end(), 0) > 0;
+      };
+      if (!has_granted_privs(db_object.privs)) {
         continue;
       }
-      std::cout << db_object.objectName.c_str();
-      switch (db_object.objectType) {
-        case (TDBObjectType::DatabaseDBObjectType): {
-          std::cout << " (database):";
-          break;
-        }
-        case (TDBObjectType::TableDBObjectType): {
-          std::cout << " (table):";
-          break;
-        }
-        case (TDBObjectType::DashboardDBObjectType): {
-          std::cout << " (dashboard):";
-          break;
-        }
-        case (TDBObjectType::ViewDBObjectType): {
-          std::cout << " (view):";
-          break;
-        }
-        default: {
-          CHECK(false);
-        }
-      }
-      print_privs(db_object.privs, db_object.objectType);
-      std::cout << std::endl;
+
+      out_row.object_name = db_object.objectName.c_str();
+      out_row.object_type = type_to_string(db_object.objectType);
+      out_row.privilege_object_type = type_to_string(db_object.privilegeObjectType);
+      out_row.privileges =
+          stringify_privs(db_object.privs, db_object.privilegeObjectType);
+
+      table_values.push_back(out_row);
     }
+    write_table_rows(table_values);
   }
 }
 
@@ -928,18 +978,15 @@ void get_db_object_privs(ClientContext& context) {
               .compare(boost::to_upper_copy<std::string>(db_object.objectName))) {
         continue;
       }
-      bool any_granted_privs = false;
-      for (size_t j = 0; j < db_object.privs.size(); j++) {
-        if (db_object.privs[j]) {
-          any_granted_privs = true;
-          break;
-        }
-      }
-      if (!any_granted_privs) {
+      auto has_granted_privs = [](const std::vector<bool>& privs_mask) -> const bool {
+        return std::accumulate(privs_mask.begin(), privs_mask.end(), 0) > 0;
+      };
+      if (!has_granted_privs(db_object.privs)) {
         continue;
       }
-      std::cout << db_object.grantee << " privileges:";
-      print_privs(db_object.privs, db_object.objectType);
+      std::cout << db_object.grantee << " privileges: ";
+      auto priv_strs = stringify_privs(db_object.privs, db_object.objectType);
+      std::cout << boost::algorithm::join(priv_strs, ", ");
       std::cout << std::endl;
     }
   }
@@ -952,7 +999,7 @@ void set_license_key(ClientContext& context, const std::string& token) {
       std::vector<std::string> jwt;
       boost::split(jwt, claims, boost::is_any_of("."));
       if (jwt.size() > 1) {
-        std::cout << mapd::decode_base64(jwt[1]) << std::endl;
+        std::cout << shared::decode_base64(jwt[1]) << std::endl;
       }
     }
   }
@@ -964,7 +1011,7 @@ void get_license_claims(ClientContext& context) {
       std::vector<std::string> jwt;
       boost::split(jwt, claims, boost::is_any_of("."));
       if (jwt.size() > 1) {
-        std::cout << mapd::decode_base64(jwt[1]) << std::endl;
+        std::cout << shared::decode_base64(jwt[1]) << std::endl;
       }
     }
   }
@@ -1061,6 +1108,8 @@ void print_status(ClientContext& context) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  bool success = true;
+
   std::string server_host{"localhost"};
   int port = 6274;
   std::string delimiter("|");
@@ -1176,7 +1225,7 @@ int main(int argc, char** argv) {
     transport = connMgr->open_buffered_client_transport(server_host, port, ca_cert_name);
     protocol = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport));
   }
-  MapDClient c(protocol);
+  OmniSciClient c(protocol);
   ClientContext context(*transport, c);
   g_client_context_ptr = &context;
 
@@ -1197,6 +1246,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (thrift_with_retry(kCONNECT, context, nullptr)) {
+    global_session = context.session;
     if (print_connection) {
       std::cout << "User " << context.user_name << " connected to database "
                 << context.db_name << std::endl;
@@ -1265,6 +1315,7 @@ int main(int argc, char** argv) {
         (void)backchannel(TURN_ON, nullptr);
         if (thrift_with_retry(kSQL, context, query.c_str())) {
           (void)backchannel(TURN_OFF, nullptr);
+          success = context.query_return.success;
           if (context.query_return.row_set.row_desc.empty()) {
             continue;
           }
@@ -1321,6 +1372,7 @@ int main(int argc, char** argv) {
           }
         } else {
           (void)backchannel(TURN_OFF, nullptr);
+          success = false;
         }
       } else {
         // change the prommpt
@@ -1495,7 +1547,7 @@ int main(int argc, char** argv) {
   }
   transport->close();
 
-  return 0;
+  return (success ? 0 : 1);
 }
 
 void oom_trace_dump() {}

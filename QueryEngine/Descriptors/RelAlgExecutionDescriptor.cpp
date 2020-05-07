@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include "RelAlgExecutionDescriptor.h"
+#include "QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
 
-#include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/topological_sort.hpp>
 
-#include "QueryEngine/RelAlgAbstractInterpreter.h"
+#include "QueryEngine/GroupByAndAggregate.h"
+#include "QueryEngine/RelAlgDagBuilder.h"
 
 ExecutionResult::ExecutionResult(const std::shared_ptr<ResultSet>& rows,
                                  const std::vector<TargetMetaInfo>& targets_meta)
@@ -87,10 +87,6 @@ const RelAlgNode* RaExecutionDesc::getBody() const {
 
 namespace {
 
-using DAG = boost::
-    adjacency_list<boost::setS, boost::vecS, boost::bidirectionalS, const RelAlgNode*>;
-using Vertex = DAG::vertex_descriptor;
-
 std::vector<Vertex> merge_sort_with_input(const std::vector<Vertex>& vertices,
                                           const DAG& graph) {
   DAG::in_edge_iterator ie_iter, ie_end;
@@ -121,39 +117,6 @@ std::vector<Vertex> merge_sort_with_input(const std::vector<Vertex>& vertices,
   return new_vertices;
 }
 
-std::vector<Vertex> merge_join_with_non_join(const std::vector<Vertex>& vertices,
-                                             const DAG& graph) {
-  DAG::out_edge_iterator oe_iter, oe_end;
-  std::unordered_set<Vertex> joins;
-  for (const auto vert : vertices) {
-    if (dynamic_cast<const RelLeftDeepInnerJoin*>(graph[vert])) {
-      joins.insert(vert);
-      continue;
-    }
-    if (!dynamic_cast<const RelJoin*>(graph[vert])) {
-      continue;
-    }
-    if (boost::out_degree(vert, graph) > 1) {
-      throw std::runtime_error("Join used more than once not supported yet");
-    }
-    boost::tie(oe_iter, oe_end) = boost::out_edges(vert, graph);
-    CHECK(boost::next(oe_iter) == oe_end);
-    const auto out_vert = boost::target(*oe_iter, graph);
-    if (!dynamic_cast<const RelJoin*>(graph[out_vert])) {
-      joins.insert(vert);
-    }
-  }
-
-  std::vector<Vertex> new_vertices;
-  for (const auto vert : vertices) {
-    if (joins.count(vert)) {
-      continue;
-    }
-    new_vertices.push_back(vert);
-  }
-  return new_vertices;
-}
-
 DAG build_dag(const RelAlgNode* sink) {
   DAG graph(1);
   graph[0] = sink;
@@ -168,12 +131,20 @@ DAG build_dag(const RelAlgNode* sink) {
     }
 
     const auto input_num = node->inputCount();
-    CHECK(input_num == 1 ||
-          (dynamic_cast<const RelLogicalValues*>(node) && input_num == 0) ||
-          (dynamic_cast<const RelModify*>(node) && input_num == 1) ||
-          (input_num == 2 && (dynamic_cast<const RelJoin*>(node) ||
-                              dynamic_cast<const RelLeftDeepInnerJoin*>(node))) ||
-          (input_num > 2 && (dynamic_cast<const RelLeftDeepInnerJoin*>(node))));
+    switch (input_num) {
+      case 0:
+        CHECK(dynamic_cast<const RelLogicalValues*>(node));
+      case 1:
+        break;
+      case 2:
+        CHECK(dynamic_cast<const RelJoin*>(node) ||
+              dynamic_cast<const RelLeftDeepInnerJoin*>(node) ||
+              dynamic_cast<const RelLogicalUnion*>(node));
+        break;
+      default:
+        CHECK(dynamic_cast<const RelLeftDeepInnerJoin*>(node) ||
+              dynamic_cast<const RelLogicalUnion*>(node));
+    }
     for (size_t i = 0; i < input_num; ++i) {
       const auto input = node->getInput(i);
       CHECK(input);
@@ -191,53 +162,171 @@ DAG build_dag(const RelAlgNode* sink) {
   return graph;
 }
 
-std::vector<const RelAlgNode*> schedule_ra_dag(const RelAlgNode* sink) {
-  CHECK(sink);
-  auto graph = build_dag(sink);
-  std::vector<Vertex> ordering;
-  boost::topological_sort(graph, std::back_inserter(ordering));
-  std::reverse(ordering.begin(), ordering.end());
-
-  std::vector<const RelAlgNode*> nodes;
-  ordering = merge_sort_with_input(ordering, graph);
-  for (auto vert : merge_join_with_non_join(ordering, graph)) {
-    nodes.push_back(graph[vert]);
+std::unordered_set<Vertex> get_join_vertices(const std::vector<Vertex>& vertices,
+                                             const DAG& graph) {
+  std::unordered_set<Vertex> joins;
+  for (const auto vert : vertices) {
+    if (dynamic_cast<const RelLeftDeepInnerJoin*>(graph[vert])) {
+      joins.insert(vert);
+      continue;
+    }
+    if (!dynamic_cast<const RelJoin*>(graph[vert])) {
+      continue;
+    }
+    if (boost::out_degree(vert, graph) > 1) {
+      throw std::runtime_error("Join used more than once not supported yet");
+    }
+    auto [oe_iter, oe_end] = boost::out_edges(vert, graph);
+    CHECK(std::next(oe_iter) == oe_end);
+    const auto out_vert = boost::target(*oe_iter, graph);
+    if (!dynamic_cast<const RelJoin*>(graph[out_vert])) {
+      joins.insert(vert);
+    }
   }
-
-  return nodes;
+  return joins;
 }
 
 }  // namespace
 
-std::vector<RaExecutionDesc> get_execution_descriptors(const RelAlgNode* ra_node) {
-  CHECK(ra_node);
-  if (dynamic_cast<const RelScan*>(ra_node) || dynamic_cast<const RelJoin*>(ra_node)) {
+RaExecutionSequence::RaExecutionSequence(const RelAlgNode* sink,
+                                         const bool build_sequence) {
+  CHECK(sink);
+  if (dynamic_cast<const RelScan*>(sink) || dynamic_cast<const RelJoin*>(sink)) {
     throw std::runtime_error("Query not supported yet");
   }
 
-  std::vector<RaExecutionDesc> descs;
-  for (const auto node : schedule_ra_dag(ra_node)) {
-    if (dynamic_cast<const RelScan*>(node)) {
-      continue;
-    }
-    descs.emplace_back(node);
-  }
+  graph_ = build_dag(sink);
 
-  return descs;
+  boost::topological_sort(graph_, std::back_inserter(ordering_));
+  std::reverse(ordering_.begin(), ordering_.end());
+
+  ordering_ = merge_sort_with_input(ordering_, graph_);
+  joins_ = get_join_vertices(ordering_, graph_);
+
+  if (build_sequence) {
+    while (next()) {
+      // noop
+    }
+  }
 }
 
-std::vector<RaExecutionDesc> get_execution_descriptors(
-    const std::vector<const RelAlgNode*>& ra_nodes) {
-  CHECK(!ra_nodes.empty());
+RaExecutionSequence::RaExecutionSequence(std::unique_ptr<RaExecutionDesc> exec_desc) {
+  descs_.emplace_back(std::move(exec_desc));
+}
 
-  std::vector<RaExecutionDesc> descs;
-  for (const auto node : ra_nodes) {
+RaExecutionDesc* RaExecutionSequence::next() {
+  while (current_vertex_ < ordering_.size()) {
+    auto vert = ordering_[current_vertex_++];
+    if (joins_.count(vert)) {
+      continue;
+    }
+    auto& node = graph_[vert];
+    CHECK(node);
+    if (dynamic_cast<const RelScan*>(node)) {
+      scan_count_++;
+      continue;
+    }
+    descs_.emplace_back(std::make_unique<RaExecutionDesc>(node));
+    return descs_.back().get();
+  }
+  return nullptr;
+}
+
+ssize_t RaExecutionSequence::nextStepId(const bool after_broadcast) const {
+  if (after_broadcast) {
+    if (current_vertex_ == ordering_.size()) {
+      return -1;
+    }
+    const auto steps_to_next_broadcast = static_cast<ssize_t>(stepsToNextBroadcast());
+    return static_cast<ssize_t>(descs_.size()) + steps_to_next_broadcast;
+  } else {
+    return current_vertex_ == ordering_.size() ? -1 : descs_.size();
+  }
+}
+
+bool RaExecutionSequence::executionFinished() const {
+  if (current_vertex_ == ordering_.size()) {
+    // All descriptors visited, execution finished
+    return true;
+  } else {
+    const auto next_step_id = nextStepId(true);
+    if (next_step_id < 0 ||
+        (static_cast<size_t>(next_step_id) == totalDescriptorsCount())) {
+      // One step remains (the current vertex), or all remaining steps can be executed
+      // without another broadcast (i.e. on the aggregator)
+      return true;
+    }
+  }
+  return false;
+}
+
+size_t RaExecutionSequence::totalDescriptorsCount() const {
+  size_t num_descriptors = 0;
+  size_t crt_vertex = 0;
+  while (crt_vertex < ordering_.size()) {
+    auto vert = ordering_[crt_vertex++];
+    if (joins_.count(vert)) {
+      continue;
+    }
+    auto& node = graph_[vert];
+    CHECK(node);
     if (dynamic_cast<const RelScan*>(node)) {
       continue;
     }
-    CHECK_GT(node->inputCount(), size_t(0));
-    descs.emplace_back(node);
+    ++num_descriptors;
   }
+  return num_descriptors;
+}
 
-  return descs;
+size_t RaExecutionSequence::stepsToNextBroadcast() const {
+  size_t steps_to_next_broadcast = 0;
+  auto crt_vertex = current_vertex_;
+  while (crt_vertex < ordering_.size()) {
+    auto vert = ordering_[crt_vertex++];
+    auto node = graph_[vert];
+    CHECK(node);
+    if (joins_.count(vert)) {
+      auto join_node = dynamic_cast<const RelLeftDeepInnerJoin*>(node);
+      CHECK(join_node);
+      if (crt_vertex < ordering_.size() - 1) {
+        // Force the parent node of the RelLeftDeepInnerJoin to run on the aggregator.
+        // Note that crt_vertex has already been incremented once above for the join node
+        // -- increment it again to account for the parent node of the join
+        ++steps_to_next_broadcast;
+        ++crt_vertex;
+        continue;
+      } else {
+        CHECK_EQ(crt_vertex, ordering_.size() - 1);
+        // If the join node parent is the last node in the tree, run all remaining steps
+        // on the aggregator
+        return ++steps_to_next_broadcast;
+      }
+    }
+    if (auto sort = dynamic_cast<const RelSort*>(node)) {
+      CHECK_EQ(sort->inputCount(), size_t(1));
+      node = sort->getInput(0);
+    }
+    if (dynamic_cast<const RelScan*>(node)) {
+      return steps_to_next_broadcast;
+    }
+    if (dynamic_cast<const RelModify*>(node)) {
+      // Modify runs on the leaf automatically, run the same node as a noop on the
+      // aggregator
+      ++steps_to_next_broadcast;
+      continue;
+    }
+    if (auto project = dynamic_cast<const RelProject*>(node)) {
+      if (project->hasWindowFunctionExpr()) {
+        ++steps_to_next_broadcast;
+        continue;
+      }
+    }
+    for (size_t input_idx = 0; input_idx < node->inputCount(); input_idx++) {
+      if (dynamic_cast<const RelScan*>(node->getInput(input_idx))) {
+        return steps_to_next_broadcast;
+      }
+    }
+    ++steps_to_next_broadcast;
+  }
+  return steps_to_next_broadcast;
 }

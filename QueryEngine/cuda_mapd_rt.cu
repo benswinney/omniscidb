@@ -1,11 +1,21 @@
 #include <cuda.h>
 #include <float.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <limits>
 #include "BufferCompaction.h"
 #include "ExtensionFunctions.hpp"
 #include "GpuRtConstants.h"
 #include "HyperLogLogRank.h"
+#include "TableFunctions/TableFunctions.hpp"
+
+extern "C" __device__ int64_t get_thread_index() {
+  return threadIdx.x;
+}
+
+extern "C" __device__ int64_t get_block_index() {
+  return blockIdx.x;
+}
 
 extern "C" __device__ int32_t pos_start_impl(const int32_t* row_index_resume) {
   return blockIdx.x * blockDim.x + threadIdx.x;
@@ -32,117 +42,34 @@ extern "C" __device__ const int64_t* init_shared_mem_nop(
 extern "C" __device__ void write_back_nop(int64_t* dest, int64_t* src, const int32_t sz) {
 }
 
-extern "C" __device__ const int64_t* init_shared_mem(const int64_t* groups_buffer,
+/*
+ * Just declares and returns a dynamic shared memory pointer. Total size should be
+ * properly set during kernel launch
+ */
+extern "C" __device__ int64_t* declare_dynamic_shared_memory() {
+  extern __shared__ int64_t shared_mem_buffer[];
+  return shared_mem_buffer;
+}
+
+/**
+ * Initializes the shared memory buffer for perfect hash group by.
+ * In this function, we simply copy the global group by buffer (already initialized on the
+ * host and transferred) to all shared memory group by buffers.
+ */
+extern "C" __device__ const int64_t* init_shared_mem(const int64_t* global_groups_buffer,
                                                      const int32_t groups_buffer_size) {
-  extern __shared__ int64_t fast_bins[];
-  if (threadIdx.x == 0) {
-    memcpy(fast_bins, groups_buffer, groups_buffer_size);
+  // dynamic shared memory declaration
+  extern __shared__ int64_t shared_groups_buffer[];
+
+  // it is assumed that buffer size is aligned with 64-bit units
+  // so it is safe to assign 64-bit to each thread
+  const int32_t buffer_units = groups_buffer_size >> 3;
+
+  for (int32_t pos = threadIdx.x; pos < buffer_units; pos += blockDim.x) {
+    shared_groups_buffer[pos] = global_groups_buffer[pos];
   }
   __syncthreads();
-  return fast_bins;
-}
-
-/**
- * Dynamically allocates shared memory per block.
- * The amount of shared memory allocated is defined at kernel launch time.
- * Returns a pointer to the beginning of allocated shared memory
- */
-extern "C" __device__ int64_t* alloc_shared_mem_dynamic() {
-  extern __shared__ int64_t groups_buffer_smem[];
-  return groups_buffer_smem;
-}
-
-/**
- * Set the allocated shared memory elements to be equal to the 'identity_element'.
- * groups_buffer_size: number of 64-bit elements in shared memory per thread-block
- * NOTE: groups_buffer_size is in units of 64-bit elements.
- */
-extern "C" __device__ void set_shared_mem_to_identity(
-    int64_t* groups_buffer_smem,
-    const int32_t groups_buffer_size,
-    const int64_t identity_element = 0) {
-#pragma unroll
-  for (int i = threadIdx.x; i < groups_buffer_size; i += blockDim.x) {
-    groups_buffer_smem[i] = identity_element;
-  }
-  __syncthreads();
-}
-
-/**
- * Initialize dynamic shared memory:
- * 1. Allocates dynamic shared memory
- * 2. Set every allocated element to be equal to the 'identity element', by default zero.
- */
-extern "C" __device__ const int64_t* init_shared_mem_dynamic(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
-  int64_t* groups_buffer_smem = alloc_shared_mem_dynamic();
-  set_shared_mem_to_identity(groups_buffer_smem, groups_buffer_size);
-  return groups_buffer_smem;
-}
-
-extern "C" __device__ void write_back(int64_t* dest, int64_t* src, const int32_t sz) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    memcpy(dest, src, sz);
-  }
-}
-
-extern "C" __device__ void write_back_smem_nop(int64_t* dest,
-                                               int64_t* src,
-                                               const int32_t sz) {}
-
-extern "C" __device__ void agg_from_smem_to_gmem_nop(int64_t* gmem_dest,
-                                                     int64_t* smem_src,
-                                                     const int32_t num_elements) {}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the stored bin ID, to be written back][32..63: the count result, to be
- * aggregated]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_binId_count(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t bin_id = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t count_result = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1,
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *reinterpret_cast<unsigned int*>(gmem_dest + i) = static_cast<int32_t>(bin_id);
-    }
-  }
-}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the count result, to be aggregated][32..63: the stored bin ID, to be written
- * back]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_count_binId(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t count_result = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t bin_id = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i),
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1) =
-          static_cast<int32_t>(bin_id);
-    }
-  }
+  return shared_groups_buffer;
 }
 
 #define init_group_by_buffer_gpu_impl init_group_by_buffer_gpu
@@ -158,6 +85,7 @@ __device__ int64_t dw_sm_cycle_start[128];  // Set from host before launching th
 // TODO(Saman): make this cycle budget something constant in codegen level
 __device__ int64_t dw_cycle_budget = 0;  // Set from host before launching the kernel
 __device__ int32_t dw_abort = 0;         // TBD: set from host (async)
+__device__ int32_t runtime_interrupt_flag = 0;
 
 __inline__ __device__ uint32_t get_smid(void) {
   uint32_t ret;
@@ -166,13 +94,13 @@ __inline__ __device__ uint32_t get_smid(void) {
 }
 
 /*
- * The main objective of this funciton is to return true, if any of the following two
- * scnearios happen:
+ * The main objective of this function is to return true, if any of the following two
+ * scenarios happen:
  * 1. receives a host request for aborting the kernel execution
  * 2. kernel execution takes longer clock cycles than it was initially allowed
  * The assumption is that all (or none) threads within a block return true for the
  * watchdog, and the first thread within each block compares the recorded clock cycles for
- * its occupying SM with the allowed budget. It also assumess that all threads entering
+ * its occupying SM with the allowed budget. It also assumes that all threads entering
  * this function are active (no critical edge exposure)
  * NOTE: dw_cycle_budget, dw_abort, and dw_sm_cycle_start[] are all variables in global
  * memory scope.
@@ -219,6 +147,10 @@ extern "C" __device__ bool dynamic_watchdog() {
   }
   __syncthreads();
   return dw_should_terminate;
+}
+
+extern "C" __device__ bool check_interrupt() {
+  return (runtime_interrupt_flag == 1) ? true : false;
 }
 
 template <typename T = unsigned long long>
@@ -300,25 +232,30 @@ __device__ int32_t get_matching_group_value_columnar_slot(int64_t* groups_buffer
                                                           const uint32_t h,
                                                           const T* key,
                                                           const uint32_t key_count) {
-  uint32_t off = h;
-  {
-    const uint64_t old =
-        atomicCAS(reinterpret_cast<T*>(groups_buffer + off), get_empty_key<T>(), *key);
-    if (old == get_empty_key<T>()) {
-      for (size_t i = 0; i < key_count; ++i) {
-        groups_buffer[off] = key[i];
-        off += entry_count;
-      }
-      return h;
+  const T empty_key = get_empty_key<T>();
+  const uint64_t old =
+      atomicCAS(reinterpret_cast<T*>(groups_buffer + h), empty_key, *key);
+  // the winner thread proceeds with writing the rest fo the keys
+  if (old == empty_key) {
+    uint32_t offset = h + entry_count;
+    for (size_t i = 1; i < key_count; ++i) {
+      *reinterpret_cast<T*>(groups_buffer + offset) = key[i];
+      offset += entry_count;
     }
   }
-  __syncthreads();
-  off = h;
-  for (size_t i = 0; i < key_count; ++i) {
-    if (groups_buffer[off] != key[i]) {
-      return -1;
+
+  __threadfence();
+  // for all threads except the winning thread, memory content of the keys
+  // related to the hash offset are checked again. In case of a complete match
+  // the hash offset is returned, otherwise -1 is returned
+  if (old != empty_key) {
+    uint32_t offset = h;
+    for (uint32_t i = 0; i < key_count; ++i) {
+      if (*reinterpret_cast<T*>(groups_buffer + offset) != key[i]) {
+        return -1;
+      }
+      offset += entry_count;
     }
-    off += entry_count;
   }
   return h;
 }
@@ -709,6 +646,33 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
   *agg = val;
 }
 
+extern "C" __device__ int32_t checked_single_agg_id_shared(int64_t* agg,
+                                                           const int64_t val,
+                                                           const int64_t null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != null_val) {
+      if (static_cast<int64_t>(old) != val) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, val);
+  } while (assumed != old);
+
+  return 0;
+}
+
 #define DEF_AGG_ID_INT_SHARED(n)                                            \
   extern "C" __device__ void agg_id_int##n##_shared(int##n##_t* agg,        \
                                                     const int##n##_t val) { \
@@ -718,18 +682,102 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
 DEF_AGG_ID_INT_SHARED(32)
 DEF_AGG_ID_INT_SHARED(16)
 DEF_AGG_ID_INT_SHARED(8)
+
 #undef DEF_AGG_ID_INT_SHARED
 
 extern "C" __device__ void agg_id_double_shared(int64_t* agg, const double val) {
   *agg = *(reinterpret_cast<const int64_t*>(&val));
 }
 
+extern "C" __device__ int32_t checked_single_agg_id_double_shared(int64_t* agg,
+                                                                  const double val,
+                                                                  const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_double_shared_slow(int64_t* agg, const double* val) {
   *agg = *(reinterpret_cast<const int64_t*>(val));
 }
 
+extern "C" __device__ int32_t
+checked_single_agg_id_double_shared_slow(int64_t* agg,
+                                         const double* valp,
+                                         const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+  double val = *valp;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_float_shared(int32_t* agg, const float val) {
   *agg = __float_as_int(val);
+}
+
+extern "C" __device__ int32_t checked_single_agg_id_float_shared(int32_t* agg,
+                                                                 const float val,
+                                                                 const float null_val) {
+  int* address_as_ull = reinterpret_cast<int*>(agg);
+  int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (old != __float_as_int(null_val)) {
+      if (old != __float_as_int(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __float_as_int(val));
+  } while (assumed != old);
+
+  return 0;
 }
 
 #define DEF_SKIP_AGG(base_agg_func)                             \
@@ -1064,7 +1112,7 @@ extern "C" __device__ bool slotEmptyKeyCAS_int32(int32_t* slot,
   const unsigned int old_value = atomicCAS(slot_address, compare_value, swap_value);
   return old_value == compare_value;
 }
-#include <stdio.h>
+
 extern "C" __device__ bool slotEmptyKeyCAS_int16(int16_t* slot,
                                                  int16_t new_val,
                                                  int16_t init_val) {
@@ -1232,4 +1280,24 @@ extern "C" __device__ void sync_warp_protected(int64_t thread_pos, int64_t row_c
     __syncwarp();
   }
 #endif
+}
+
+extern "C" __device__ void sync_threadblock() {
+  __syncthreads();
+}
+
+/*
+ * Currently, we just use this function for handling non-grouped aggregates
+ * with COUNT queries (with GPU shared memory used). Later, we should generate code for
+ * this depending on the type of aggregate functions.
+ * TODO: we should use one contiguous global memory buffer, rather than current default
+ * behaviour of multiple buffers, each for one aggregate. Once that's resolved, we can do
+ * much cleaner than this function
+ */
+extern "C" __device__ void write_back_non_grouped_agg(int64_t* input_buffer,
+                                                      int64_t* output_buffer,
+                                                      const int32_t agg_idx) {
+  if (threadIdx.x == agg_idx) {
+    agg_sum_shared(output_buffer, input_buffer[agg_idx]);
+  }
 }

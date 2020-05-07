@@ -42,19 +42,35 @@ public class ExtensionFunction {
     PInt64,
     PFloat,
     PDouble,
+    PBool,
     Bool,
     ArrayInt8,
     ArrayInt16,
     ArrayInt32,
     ArrayInt64,
     ArrayFloat,
-    ArrayDouble
+    ArrayDouble,
+    ArrayBool,
+    GeoPoint,
+    GeoLineString,
+    Cursor,
+    GeoPolygon,
+    GeoMultiPolygon
   }
   ;
 
   ExtensionFunction(final List<ExtArgumentType> args, final ExtArgumentType ret) {
     this.args = args;
     this.ret = ret;
+    this.isRowUdf = true;
+  }
+
+  ExtensionFunction(final List<ExtArgumentType> args,
+          final ExtArgumentType ret,
+          final boolean row_udf) {
+    this.args = args;
+    this.ret = ret;
+    this.isRowUdf = row_udf;
   }
 
   public List<ExtArgumentType> getArgs() {
@@ -63,6 +79,14 @@ public class ExtensionFunction {
 
   public ExtArgumentType getRet() {
     return this.ret;
+  }
+
+  public boolean isRowUdf() {
+    return this.isRowUdf;
+  }
+
+  public boolean isTableUdf() {
+    return !this.isRowUdf();
   }
 
   public String toJson(final String name) {
@@ -99,6 +123,8 @@ public class ExtensionFunction {
         return "float";
       case Double:
         return "double";
+      case Void:
+        return "void";
       case PInt8:
         return "i8*";
       case PInt16:
@@ -111,19 +137,34 @@ public class ExtensionFunction {
         return "float*";
       case PDouble:
         return "double*";
+      case PBool:
+        return "i1*";
       case ArrayInt8:
-        return "array_i8";
+        return "{i8*, i64, i8}*";
       case ArrayInt16:
-        return "array_i16";
+        return "{i16*, i64, i8}*";
       case ArrayInt32:
-        return "array_i32";
+        return "{i32*, i64, i8}*";
       case ArrayInt64:
-        return "array_i64";
+        return "{i64*, i64, i8}*";
       case ArrayFloat:
-        return "array_float";
+        return "{float*, i64, i8}*";
       case ArrayDouble:
-        return "array_double";
+        return "{double*, i64, i8}*";
+      case ArrayBool:
+        return "{i1*, i64, i8}*";
+      case GeoPoint:
+        return "geo_point";
+      case Cursor:
+        return "cursor";
+      case GeoLineString:
+        return "geo_linestring";
+      case GeoPolygon:
+        return "geo_polygon";
+      case GeoMultiPolygon:
+        return "geo_multi_polygon";
     }
+    MAPDLOGGER.info("Extensionfunction::typeName: unknown type=`" + type + "`");
     assert false;
     return null;
   }
@@ -134,4 +175,5 @@ public class ExtensionFunction {
 
   private final List<ExtArgumentType> args;
   private final ExtArgumentType ret;
+  private final boolean isRowUdf;
 }
